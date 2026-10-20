@@ -363,12 +363,26 @@ On the command line: `validate ... --skip-done data/verdicts_done.jsonl --retry 
    `IMAGE_UNAVAILABLE` and `INFRA_ERROR` tasks are retried. The next `merge` includes the
    earlier verdicts, so the newest `stage1` artifact always has the full picture.
 
-**The real bottleneck is Docker Hub's pull limit**, not CPU: a free account may pull **200
-images per 6 hours** (100 without logging in), counted per image, not per layer. About 7,500 of
-your images are on Docker Hub (SWE-bench, SWE-Gym, R2E-Gym, SWE-smith, ProMax), so a free
-account needs roughly 9–10 days of wall time however many runners you use. Pulls over the
-limit come back as `IMAGE_UNAVAILABLE` and are retried on the next run. A Docker **Pro**
-subscription has no pull cap, so with it the full run takes roughly 10–15 hours (about 7,800 tasks × 3 min ÷ 40 parallel workers).
+**Docker Hub's pull limit** is the real bottleneck, not CPU. Check yours (a check is not a pull):
+
+```python
+import requests
+user, pat, image = "DOCKERHUB_USER", "DOCKERHUB_TOKEN", "ratelimitpreview/test"
+tok = requests.get("https://auth.docker.io/token", auth=(user, pat),
+                   params={"service": "registry.docker.io", "scope": f"repository:{image}:pull"}).json()["token"]
+h = requests.head(f"https://registry-1.docker.io/v2/{image}/manifests/latest",
+                  headers={"Authorization": f"Bearer {tok}"}).headers
+print(h.get("ratelimit-limit"), h.get("ratelimit-remaining"))   # e.g. "200;w=3600": 200 pulls per hour
+```
+
+A pull is counted per image (not per layer), per account when logged in. Images already on the
+machine cost nothing. When the limit is hit, the runner **waits instead of failing**: all workers
+pause (1, 2, 4, 8, then every 10 minutes) and retry; only after `--rate-limit-wait` minutes
+(default 90) does a task get `IMAGE_UNAVAILABLE`, which the next run retries.
+
+At 200 pulls per hour, validating 4,500 tasks takes about a day of wall time whatever the number of
+runners, so more parallel jobs don't help: use `num_shards` 10 and re-run until done (each run
+stops cleanly after `max_minutes`). A Docker Pro subscription removes the cap and makes it a few hours.
 SWE-bench Pro's images are on GitHub's registry and aren't affected.
 
 **Validating before the teacher runs** costs a second pull of each image later (the teacher

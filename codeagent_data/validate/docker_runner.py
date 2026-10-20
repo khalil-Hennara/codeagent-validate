@@ -32,16 +32,27 @@ class RunResult:
 
 class DockerRunner:
     def __init__(self, *, mem_limit: str = "8g", cpus: float = 2.0, network: bool = True,
-                 platform: str | None = "linux/amd64", pull: bool = True, workers: int = 4):
+                 platform: str | None = "linux/amd64", pull: bool = True, workers: int = 4,
+                 rate_limit_wait_minutes: float = 90.0, client=None):
         # one client shared by all worker threads; size its connection pool for them
-        self.client = docker.from_env(timeout=600, max_pool_size=max(10, 2 * workers + 4))
+        self.client = client or docker.from_env(timeout=600, max_pool_size=max(10, 2 * workers + 4))
         self.mem_limit, self.cpus, self.network = mem_limit, cpus, network
         self.platform, self.pull = platform, pull
         self._pull_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._guard = threading.Lock()
+        # Docker Hub pull limit: when any worker hits it, every worker pauses until this time
+        self.rate_limit_wait_s = rate_limit_wait_minutes * 60
+        self._paused_until = 0.0
+        self._sleep = time.sleep
 
     def ensure_image(self, image: str) -> str | None:
-        """Pull once per image even when several workers need it at the same time."""
+        """Pull once per image, even when several workers need it at the same time.
+
+        On Docker Hub's pull limit ("toomanyrequests") the pull is retried with growing waits
+        (1, 2, 4, 8, then every 10 minutes) instead of failing the task, and all workers pause
+        together. After `rate_limit_wait_minutes` of waiting the task gets IMAGE_UNAVAILABLE,
+        which a later run retries.
+        """
         with self._guard:
             lock = self._pull_locks[image]
         with lock:
@@ -51,11 +62,24 @@ class DockerRunner:
             except ImageNotFound:
                 if not self.pull:
                     return f"image {image} not present and --no-pull set"
-            try:
-                self.client.images.pull(image, platform=self.platform)
-                return None
-            except Exception as e:  # noqa: BLE001
-                return f"pull failed for {image}: {e}"
+            waited, delay = 0.0, 60.0
+            while True:
+                pause = self._paused_until - time.time()
+                if pause > 0:  # another worker hit the limit: wait with it
+                    self._sleep(pause)
+                    waited += pause
+                try:
+                    self.client.images.pull(image, platform=self.platform)
+                    return None
+                except Exception as e:  # noqa: BLE001
+                    msg = str(e)
+                    limited = "toomanyrequests" in msg.lower() or "rate limit" in msg.lower()
+                    if not limited or waited >= self.rate_limit_wait_s:
+                        return f"pull failed for {image}: {msg}"
+                    with self._guard:
+                        self._paused_until = max(self._paused_until, time.time() + delay)
+                    print(f"Docker Hub pull limit reached; all workers pause {delay / 60:.0f} min", flush=True)
+                    delay = min(delay * 2, 600.0)
 
     @staticmethod
     def _put(container, path: str, content: str) -> None:

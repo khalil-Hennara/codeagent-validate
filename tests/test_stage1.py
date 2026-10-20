@@ -289,6 +289,51 @@ def test_retry_reasons_rerun_only_those():
         assert len(again) == 3 and all(v.valid for v in again)
 
 
+def test_pull_limit_waits_instead_of_failing():
+    from docker.errors import ImageNotFound
+    from codeagent_data.validate.docker_runner import DockerRunner
+
+    class Images:
+        def __init__(self, fails):
+            self.fails, self.pulls = fails, 0
+        def get(self, image):
+            raise ImageNotFound("no")
+        def pull(self, image, platform=None):
+            self.pulls += 1
+            if self.pulls <= self.fails:
+                raise Exception("toomanyrequests: You have reached your pull rate limit")
+
+    class Client:
+        def __init__(self, fails):
+            self.images = Images(fails)
+
+    slept = []
+    r = DockerRunner(client=Client(fails=2), rate_limit_wait_minutes=90)
+    r._sleep = lambda s: slept.append(s)
+    r._paused_until = 0.0
+    import time as _t
+    real = _t.time
+    clock = [real()]
+    try:  # fast-forward the clock whenever the runner "sleeps"
+        _t.time = lambda: clock[0]
+        r._sleep = lambda s: (slept.append(s), clock.__setitem__(0, clock[0] + s))
+        assert r.ensure_image("img:1") is None and r.client.images.pulls == 3
+        assert [round(x) for x in slept] == [60, 120]
+        r2 = DockerRunner(client=Client(fails=99), rate_limit_wait_minutes=5)
+        r2._sleep = r._sleep
+        err = r2.ensure_image("img:2")
+        assert err and "toomanyrequests" in err  # gives up after the wait budget
+        r3 = DockerRunner(client=Client(fails=0))
+        assert r3.ensure_image("img:3") is None
+        class Bad(Images):
+            def pull(self, image, platform=None):
+                raise Exception("manifest unknown")
+        c = Client(0); c.images = Bad(0)
+        assert "manifest unknown" in DockerRunner(client=c).ensure_image("img:4")  # no waiting for real errors
+    finally:
+        _t.time = real
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

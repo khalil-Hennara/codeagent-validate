@@ -168,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
     val.add_argument("--no-pull", action="store_true")
     val.add_argument("--prune-images", action="store_true", help="delete each image after its task (bounded disk)")
     val.add_argument("--limit", type=int, default=0)
+    val.add_argument("--rate-limit-wait", type=float, default=90.0,
+                     help="minutes a task may wait for Docker Hub's pull limit before it is marked IMAGE_UNAVAILABLE")
     val.add_argument("--max-minutes", type=float, default=None,
                      help="stop starting new tasks after this many minutes (for time-limited machines/CI)")
     val.add_argument("--skip-done", nargs="*", default=[], help="verdicts.jsonl files from earlier runs: skip those tasks")
@@ -285,7 +287,8 @@ def run_validate(args: argparse.Namespace) -> int:
     def factory():
         from .validate.docker_runner import DockerRunner
         return DockerRunner(mem_limit=args.mem, cpus=args.cpus, network=not args.offline,
-                            pull=not args.no_pull, workers=args.workers)
+                            pull=not args.no_pull, workers=args.workers,
+                            rate_limit_wait_minutes=args.rate_limit_wait)
 
     out = Path(args.out)
     run_validation(tasks, factory, out, workers=args.workers, repeat=args.repeat,
