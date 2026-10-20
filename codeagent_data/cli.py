@@ -171,6 +171,8 @@ def main(argv: list[str] | None = None) -> int:
     val.add_argument("--max-minutes", type=float, default=None,
                      help="stop starting new tasks after this many minutes (for time-limited machines/CI)")
     val.add_argument("--skip-done", nargs="*", default=[], help="verdicts.jsonl files from earlier runs: skip those tasks")
+    val.add_argument("--retry", nargs="*", default=[],
+                     help="verdict reasons to run again instead of skipping, e.g. --retry NO_TEST_OUTPUT GOLD_FAILS_F2P")
 
     sel = sub.add_parser("select", help="rank tasks so the first N solved ones are the most reliable mix")
     sel.add_argument("--stage0", required=True, help="ingest output folder (normalized.jsonl + tasks/)")
@@ -246,13 +248,21 @@ def write_stage1_outputs(tasks: list[dict], verdict_files: list[Path], out: Path
                 t = {**t, "validation": {k: v.get(k) for k in ("route", "mode", "strict_file_pass", "flaky", "seconds")}}
                 f.write(json.dumps(t, ensure_ascii=False) + "\n")
     by_source: dict[str, Counter] = {}
+    reason_src: dict[str, Counter] = {}
     src_of = {t["instance_id"]: t.get("verifier") or t.get("source") or "?" for t in tasks}
     for v in judged:
-        by_source.setdefault(src_of.get(v["instance_id"], "?"), Counter())["valid" if v["valid"] else "invalid"] += 1
+        src = src_of.get(v["instance_id"], "?")
+        by_source.setdefault(src, Counter())["valid" if v["valid"] else "invalid"] += 1
+        reason_src.setdefault(v["reason"].split(":")[0].split(" (")[0], Counter())[src] += 1
     lines = ["# Stage 1 report", "",
              f"tasks: {len(tasks)}  judged: {len(judged)}  valid: {n_valid}  not yet run: {len(tasks) - len(judged)}", ""]
     lines += [f"- {k}: {c}" for k, c in reasons.most_common()]
     lines += ["", "## By source", ""] + [f"- {k}: {dict(c)}" for k, c in sorted(by_source.items())]
+    srcs = sorted(by_source)
+    lines += ["", "## Reasons by source", "", "| reason | " + " | ".join(srcs) + " |",
+              "| --- |" + " --- |" * len(srcs)]
+    for reason, c in sorted(reason_src.items(), key=lambda kv: -sum(kv[1].values())):
+        lines.append(f"| {reason} | " + " | ".join(str(c.get(s, 0)) for s in srcs) + " |")
     strict = sum(1 for v in judged if v["valid"] and v.get("strict_file_pass"))
     lines += ["", f"valid and every test that ran passes (competition-style rule): {strict}"]
     (out / "report.md").write_text("\n".join(lines) + "\n")
@@ -265,7 +275,7 @@ def run_validate(args: argparse.Namespace) -> int:
     tasks = select_shard(_read_jsonl(args.tasks), args.shard)
     if args.skip_done:  # verdicts from earlier runs / other machines
         from .validate.validator import is_final
-        done = {v["instance_id"] for v in _read_jsonl([p for p in args.skip_done if Path(p).exists()]) if is_final(v)}
+        done = {v["instance_id"] for v in _read_jsonl([p for p in args.skip_done if Path(p).exists()]) if is_final(v, tuple(args.retry))}
         tasks = [t for t in tasks if t["instance_id"] not in done]
     if args.limit:
         tasks = tasks[: args.limit]
@@ -279,7 +289,8 @@ def run_validate(args: argparse.Namespace) -> int:
 
     out = Path(args.out)
     run_validation(tasks, factory, out, workers=args.workers, repeat=args.repeat,
-                   timeout_s=args.timeout, prune_images=args.prune_images, max_minutes=args.max_minutes)
+                   timeout_s=args.timeout, prune_images=args.prune_images, max_minutes=args.max_minutes,
+                   retry=tuple(args.retry))
     write_stage1_outputs(tasks, [out / "verdicts.jsonl"], out)
     return 0
 

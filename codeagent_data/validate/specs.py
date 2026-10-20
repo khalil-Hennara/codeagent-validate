@@ -92,7 +92,23 @@ def _parser_by_name(name: str | None, repo: str):
     return fn or _fallback_pytest_parser
 
 
+def _no_nounset(plan: EvalPlan) -> EvalPlan:
+    """Drop `set -u` from the script header.
+
+    Conda's activate.d scripts for compiler toolchains (e.g. SWE-Gym's pandas images) read unset
+    variables; under `set -u` bash aborts at `conda activate testbed`, before any test runs
+    (seen as NO_TEST_OUTPUT). `-u` never changes a test result, so removing it is safe, also
+    for the official SWE-bench scripts.
+    """
+    plan.script = plan.script.replace("set -uxo pipefail", "set -xo pipefail", 1)
+    return plan
+
+
 def build_plan(task: dict[str, Any]) -> EvalPlan:
+    return _no_nounset(_build_plan(task))
+
+
+def _build_plan(task: dict[str, Any]) -> EvalPlan:
     """Pick the test script + parser for a task, in order of trust:
 
     1. row-eval-script : the dataset row ships the official eval.sh + log parser name (SWE-bench on HF).
@@ -163,7 +179,7 @@ def _generic_plan(task: dict[str, Any]) -> EvalPlan:
     reset = f"git checkout {base} -- {' '.join(shlex.quote(p) for p in existing)}" if existing else ":"
     lines = [
         "#!/bin/bash",
-        "set -uxo pipefail",
+        "set -xo pipefail",
         "if [ -f /opt/miniconda3/bin/activate ]; then source /opt/miniconda3/bin/activate; conda activate testbed || true; fi",
         f"cd {shlex.quote(workdir)}",
         f"git config --global --add safe.directory {shlex.quote(workdir)}",
@@ -202,7 +218,7 @@ if [ -d /r2e_tests ]; then find /r2e_tests -name '*.pyc' -delete; rm -rf /root/r
 def _r2e_plan(task: dict[str, Any]) -> EvalPlan:
     script = "\n".join([
         "#!/bin/bash",
-        "set -uxo pipefail",
+        "set -xo pipefail",
         _R2E_SETUP.rstrip("\n"),
         f": '{START}'",
         "bash /root/run_tests.sh",

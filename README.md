@@ -346,6 +346,13 @@ and parquet files. Run `!git status --short | head` before committing if you wan
    a fix before the full run. `IMAGE_UNAVAILABLE` on a free Docker account just means the pull
    limit was hit: those tasks are retried next time.
 
+**Re-running after a runner fix.** Tasks with a final verdict are skipped on the next run. To run
+only some of them again (e.g. `NO_TEST_OUTPUT` after a fix to the test scripts), download the
+`stage1` artifact, copy its `verdicts_merged.jsonl` to `data/verdicts_done.jsonl` in Colab,
+commit and push, then *Run workflow* with `retry` = `NO_TEST_OUTPUT` (several reasons:
+space-separated). Everything else is skipped, so only those images are pulled again.
+On the command line: `validate ... --skip-done data/verdicts_done.jsonl --retry NO_TEST_OUTPUT`.
+
 **D. Full run (after subscribing to Docker Pro)**
 
 8. *Run workflow* with tasks `data/full/*.jsonl`, `num_shards` 40. Up to 20 jobs run at once;

@@ -254,6 +254,41 @@ def test_merge_combines_shards_later_wins():
         assert valid == ["t1"] and (d / "m/verdicts_merged.jsonl").exists()
 
 
+def test_no_nounset_in_any_route():
+    r2e = dict(R2E_TASK)
+    generic = dict(DJANGO_TASK, repo="pandas-dev/pandas", version="",
+                   test_patch=TEST_PATCH.replace("tests/queries/test_qs_combinators.py", "pandas/tests/test_x.py"))
+    official = dict(DJANGO_TASK, eval_script="#!/bin/bash\nset -uxo pipefail\nsource /opt/miniconda3/bin/activate\n",
+                    log_parser="parse_log_django")
+    for t in (DJANGO_TASK, generic, r2e, official):
+        script = build_plan(t).script
+        assert "set -u" not in script and "set -xo pipefail" in script, script[:120]
+
+
+def test_retry_reasons_rerun_only_those():
+    import tempfile
+    from codeagent_data.validate.validator import run_validation
+
+    class R(FakeRunner):
+        def __init__(self, broken):
+            self.broken = broken
+        def run(self, image, script, *, workdir, patches=None, timeout_s=1800):
+            gold = "gold" in [l for l, _ in (patches or [])]
+            if self.broken:  # a crash before tests: no test output
+                return RunResult(True, ">>>>> Eval script\nunbound variable\n", "done", 0.0)
+            return RunResult(True, django_log(gold), "done", 0.0)
+        def remove_image(self, image):
+            pass
+
+    tasks = [dict(DJANGO_TASK, instance_id=f"t{i}", env_image="img") for i in range(3)]
+    with tempfile.TemporaryDirectory() as d:
+        vs = run_validation(tasks, lambda: R(True), Path(d), workers=2)
+        assert all(v.reason.startswith("NO_TEST_OUTPUT") for v in vs)
+        assert run_validation(tasks, lambda: R(False), Path(d), workers=2) == []  # final: skipped
+        again = run_validation(tasks, lambda: R(False), Path(d), workers=2, retry=("NO_TEST_OUTPUT",))
+        assert len(again) == 3 and all(v.valid for v in again)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -17,8 +17,10 @@ PASS = {"PASSED", "XFAIL"}
 RETRYABLE = ("IMAGE_UNAVAILABLE", "INFRA_ERROR")
 
 
-def is_final(verdict: dict[str, Any]) -> bool:
-    return not str(verdict.get("reason", "")).startswith(RETRYABLE)
+def is_final(verdict: dict[str, Any], retry: tuple[str, ...] = ()) -> bool:
+    """False if the task should run again: infrastructure failures always, plus any reason
+    prefixes passed in `retry` (e.g. ("NO_TEST_OUTPUT",) after a runner fix)."""
+    return not str(verdict.get("reason", "")).startswith(RETRYABLE + tuple(retry))
 _TEST_PATCH_ERR = re.compile(r"^(error: (patch failed|corrupt patch|.*does not apply|.*No such file)).*$", re.M)
 
 
@@ -195,7 +197,8 @@ def select_shard(tasks: list[dict[str, Any]], shard: str | None) -> list[dict[st
 
 def run_validation(tasks: list[dict[str, Any]], runner_factory: Callable[[], Any], out_dir: Path, *,
                    workers: int = 4, repeat: int = 1, timeout_s: int = 1800, keep_logs: bool = True,
-                   prune_images: bool = False, max_minutes: float | None = None) -> list[Verdict]:
+                   prune_images: bool = False, max_minutes: float | None = None,
+                   retry: tuple[str, ...] = ()) -> list[Verdict]:
     """Validate tasks in parallel, one task per worker thread. Resumable via verdicts.jsonl.
 
     max_minutes: stop starting new tasks after this long (tasks already running finish), so a
@@ -210,7 +213,7 @@ def run_validation(tasks: list[dict[str, Any]], runner_factory: Callable[[], Any
     results_fp = out_dir / "verdicts.jsonl"
     done: set[str] = set()
     if results_fp.exists():  # resumable
-        done = {v["instance_id"] for v in iter_jsonl(results_fp) if is_final(v)}
+        done = {v["instance_id"] for v in iter_jsonl(results_fp) if is_final(v, retry)}
     # tasks sharing an image run next to each other, so the image is pulled once and reused
     todo = sorted((t for t in tasks if t["instance_id"] not in done),
                   key=lambda t: (t.get("env_image") or "", t["instance_id"]))
