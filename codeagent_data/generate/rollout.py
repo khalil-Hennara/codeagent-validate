@@ -17,6 +17,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections import Counter
@@ -154,6 +155,30 @@ def make_image_sandbox(task: dict[str, Any], cfg: GenConfig, put_file: Callable[
     return sb
 
 
+# Reasoning that leans on remembered project history instead of the code in front of the model:
+# the student cannot do this, and the recalled hashes / PR numbers are usually invented.
+RECALL_RE = re.compile(
+    r"(?i)\b(?:upstream(?: \w+){0,2} (?:fix|fixed|commit|code|patch|version|change|implementation|pr)|"
+    r"(?:actual|real|official)(?: \w+){0,2} (?:fix|commit|patch|implementation)|"
+    r"(?:let me |i )recall|from memory|"
+    r"(?:pr|pull request|ticket|issue|gh) ?#?\d{3,}|gh-\d{3,}|commit [0-9a-f]{7,40}|"
+    r"release notes?|current (?:main|master)|\w+ (?:main|master) (?:has|today)|later versions?|"
+    r"fixed in (?:version |v)?\d+\.\d+)")
+
+
+# a single hit is usually innocent (an issue number quoted from a code comment, "the actual fix is
+# ..."); trajectories that build on remembered history have many (8-49 in the pilot, 0-1 otherwise)
+RECALL_LIMIT = 3
+
+
+def recalls_history(row: dict[str, Any]) -> bool:
+    return (row.get("stats") or {}).get("recall_mentions", 0) >= RECALL_LIMIT
+
+
+def recall_mentions(text: str) -> int:
+    return len(RECALL_RE.findall(text or ""))
+
+
 def trace_stats(trace: Any) -> dict[str, int]:
     st = Counter()
     for e in trace.entries if trace is not None else []:
@@ -166,6 +191,8 @@ def trace_stats(trace: Any) -> dict[str, int]:
         et = getattr(e, "event_type", "")
         st["tool_calls"] += et == "tool_call"
         st["thinking_entries"] += et == "thinking"
+        if et in ("thinking", "text", "final"):
+            st["recall_mentions"] += recall_mentions(getattr(e, "content", ""))
     return dict(st)
 
 
@@ -341,8 +368,8 @@ def verify_patch(task: dict[str, Any], patch: str, runner: Any, timeout_s: int =
 def retry_worthy(a: "Attempt") -> bool:
     """Spend a second try only where the first one got somewhere: half or more of the F2P tests
     pass, or the patch edits the right files, or the budget ran out before a patch existed."""
-    if a.solved:
-        return False
+    if a.solved:  # solved, but with recalled-history reasoning: a clean sample is likely
+        return True
     if a.reason.startswith("NO_PATCH"):
         return True
     return (a.tests.get("f2p_pass_frac", 0) >= 0.5) or bool(a.loc.get("hit"))
@@ -435,7 +462,7 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
     for r in earlier:
         if is_final(r):
             finals.setdefault(r["instance_id"], set()).add(int(r.get("attempt") or 1))
-            if r.get("solved"):
+            if r.get("solved") and not recalls_history(r):
                 solved_ids.setdefault(r["instance_id"], r)
     solved_src = Counter(r["verifier"] for r in solved_ids.values())
     solved_repo = Counter((r.get("repo") or "").lower() for r in solved_ids.values())
@@ -489,10 +516,11 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
             if prune_images and t.get("env_image") and sandbox_factory is None:
                 runner.remove_image(t["env_image"])
             with lock:
-                if a.solved:
+                usable = a.solved and not recalls_history(asdict(a))
+                if usable:
                     solved_src[a.verifier] += 1
                     solved_repo[a.repo.lower()] += 1
-                elif is_final(asdict(a)) and k < attempts and retry_worthy(a):
+                elif is_final(asdict(a)) and k < attempts and (a.solved or retry_worthy(a)):
                     queue.append((t, k + 1))  # another sample later
                 if a.reason.startswith("FATAL_API_ERROR"):
                     state["stop"] = f"fatal API error, stopping: {a.reason[:200]}"
@@ -559,6 +587,11 @@ def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any]
     for s, c in sorted(by_src.items()):
         lines.append(f"| {s} | {c['attempted']} | {c['solved']} | {c['solved'] / max(1, c['attempted']):.0%} |")
     lines += ["", "## Outcomes", ""] + [f"- {k}: {v}" for k, v in reasons.most_common()]
+    solved_rows = [r for r in final if r.get("solved")]
+    if solved_rows:
+        rec = sum(recalls_history(r) for r in solved_rows)
+        lines += ["", f"solved attempts whose reasoning recalls project history (excluded from solved.jsonl): "
+                      f"{rec} of {len(solved_rows)}"]
     unsolved = [r for r in final if not r.get("solved") and r.get("patch")]
     if unsolved:
         near = sum((r.get("tests") or {}).get("f2p_pass_frac", 0) >= 0.5 for r in unsolved)
@@ -602,7 +635,7 @@ def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any]
 
 
 def merge_generation(tasks: list[dict[str, Any]], result_files: list[Path], targets: dict[str, Any],
-                     out: Path) -> dict[str, int]:
+                     out: Path, keep_recall: bool = False) -> dict[str, int]:
     """Combine results from shards and earlier runs (later files win) and apply the GLOBAL limits:
     solved tasks are accepted in selection-rank order while their source / repo is under its cap.
 
@@ -634,6 +667,8 @@ def merge_generation(tasks: list[dict[str, Any]], result_files: list[Path], targ
     for key in sorted(rows, key=lambda k: k[1]):
         r = rows[key]
         if r.get("solved") and r["instance_id"] in by_id:
+            if not keep_recall and recalls_history(r):
+                continue  # reasoning built on remembered history: not something the student can learn
             first_solved.setdefault(r["instance_id"], r)
     solved = sorted(first_solved.values(), key=lambda r: int(by_id[r["instance_id"]].get("selection_rank", 1 << 30)))
     src_c: Counter[str] = Counter()

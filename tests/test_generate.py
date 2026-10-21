@@ -266,6 +266,26 @@ def test_retry_only_when_promising_and_flaky_rerun():
     print("ok test_retry_only_when_promising_and_flaky_rerun")
 
 
+def test_recall_of_project_history_is_flagged():
+    recalled = ("The actual pandas fix (PR #48425) changed this. Let me recall the upstream commit "
+                "6d42d5e1a2e9 from pandas main today; it was fixed in version 1.5.1 per the release notes.")
+    assert rollout.recall_mentions(recalled) >= rollout.RECALL_LIMIT
+    for innocent in ["the issue #12 says", "the upstream caller passes x", "# GH3485 in the test file",
+                     "the actual fix is to change line 3", "git checkout main"]:
+        assert rollout.recall_mentions(innocent) <= 1, innocent
+    row = {"instance_id": "x", "solved": True, "verifier": "swe_gym", "repo": "a/b", "stats": {"recall_mentions": 9}}
+    ok_row = {**row, "instance_id": "y", "stats": {"recall_mentions": 1}}
+    out = Path(tempfile.mkdtemp())
+    (out / "r.jsonl").write_text("\n".join(json.dumps(r) for r in (row, ok_row)) + "\n")
+    tasks = [{**TASK, "instance_id": "x", "repo": "a/b"}, {**TASK, "instance_id": "y", "repo": "a/b"}]
+    targets = {"solved_target": 10, "max_per_repo": 100, "max_share": {}}
+    st = rollout.merge_generation(tasks, [out / "r.jsonl"], targets, out / "m")
+    assert st["accepted"] == 1 and "recalls project history (excluded from solved.jsonl): 1 of 2" in \
+        (out / "m" / "generation_report.md").read_text()
+    assert rollout.merge_generation(tasks, [out / "r.jsonl"], targets, out / "m2", keep_recall=True)["accepted"] == 2
+    print("ok test_recall_of_project_history_is_flagged")
+
+
 def test_stops_when_the_api_keeps_failing():
     calls = []
 
@@ -330,6 +350,7 @@ def test_prepare_script_in_container_layout():
 
 if __name__ == "__main__":
     test_classify_and_shards()
+    test_recall_of_project_history_is_flagged()
     test_stops_when_the_api_keeps_failing()
     test_second_attempt_and_verify_log()
     test_retry_only_when_promising_and_flaky_rerun()

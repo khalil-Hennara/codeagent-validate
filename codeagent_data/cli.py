@@ -232,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
     gm.add_argument("--results", nargs="+", required=True, help="results.jsonl / results_merged.jsonl (later win)")
     gm.add_argument("--targets", help="targets.json from select")
     gm.add_argument("--n", type=int, default=2400)
+    gm.add_argument("--keep-recall", action="store_true",
+                    help="also accept solved attempts whose reasoning recalls the project's history")
     gm.add_argument("--out", required=True)
     args = ap.parse_args(argv)
     if args.cmd == "generate":
@@ -239,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "generate-merge":
         from .generate.rollout import merge_generation
         merge_generation(_read_jsonl(args.tasks), [Path(p) for p in args.results],
-                         _load_targets(args.targets, args.n), Path(args.out))
+                         _load_targets(args.targets, args.n), Path(args.out), keep_recall=args.keep_recall)
         return 0
     if args.cmd == "ingest":
         return run_ingest(args)

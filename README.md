@@ -545,6 +545,12 @@ near-misses that edited the right files stay in `results_merged.jsonl` for local
 The report shows the solve rate by size of the reference fix; `MAX_GOLD_LINES` /
 `MAX_GOLD_FILES` in the workflow (or `--max-gold-lines/--max-gold-files`) skip larger tasks.
 
+The teacher must reason only from what it observes. Kimi otherwise "recalls" the project's real
+fix (commit hashes, PR numbers, "pandas main today"), which the student cannot do and which is
+mostly invented. The prompt forbids it, and every attempt counts such phrases
+(`stats.recall_mentions`); a solved attempt with 3 or more is not counted, gets another try, and
+is left out of `solved.jsonl` (`generate-merge --keep-recall` to include it).
+
 Before any container starts, `generate` sends one small request through exactly the agent's
 model path (`preflight OK ... reasoning returned: yes` in the log); a wrong key, model id or a
 missing dependency stops the job there. If the API still fails 3 times in a row during the run

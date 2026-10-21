@@ -27,7 +27,9 @@ from codeagent_data.generate import rollout  # noqa: E402
 from codeagent_data.validate.docker_runner import DockerRunner  # noqa: E402
 
 PROBE = ("git log --all --oneline; git tag; git branch -a; ls /r2e_tests; readlink /testbed; "
-         "pwd; git status --porcelain; git log -1 --format=%s")
+         "pwd; git status --porcelain; git log -1 --format=%s; "
+         "cd /tmp && python3 -c 'import calc; print(\"IMPORTED_FROM\", calc.__file__)'; "
+         "cat $(python3 -c 'import site; print(site.getsitepackages()[0])')/toy_editable.pth")
 SCRIPT = [("run_command", {"command": PROBE})] + wire.FIX_SCRIPT
 
 
@@ -57,6 +59,9 @@ def main():
     assert a.solved, (a.reason, a.agent_error)
     assert "FUTURE" not in probe and "future fix" not in probe and "v9.9" not in probe, probe
     assert "test_hidden" not in probe and "upstream" not in probe, probe
+    out_txt = json.loads(probe)["stdout"]
+    assert "IMPORTED_FROM /workspace/calc.py" in out_txt, out_txt  # tracebacks show /workspace
+    assert "/opt/miniconda3/envs/testbed/lib/extra" in out_txt, out_txt  # env paths untouched
     print("ok test_generate_docker", a.reason, a.stats, f"{a.seconds:.1f}s")
     shutil.rmtree(out, ignore_errors=True)
 

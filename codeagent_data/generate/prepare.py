@@ -48,6 +48,17 @@ if [ "$SRC" != "$WS" ] && [ -d "$SRC" ] && [ ! -L "$SRC" ]; then
   ln -s "$WS" "$SRC"
 fi
 cd "$WS"
+# 1b. installed-package pointers (editable installs, .pth files) name the old path; point them at
+# $WS so imports, tracebacks and test runners show /workspace, as in the competition sandbox
+if [ "$SRC" != "$WS" ]; then
+  for sp in $(find /opt /usr /root "$WS/.venv" -maxdepth 6 -type d \\( -name site-packages -o -name dist-packages \\) 2>/dev/null); do
+    for f in "$sp"/*.pth "$sp"/*.egg-link "$sp"/__editable__* "$sp"/*.dist-info/direct_url.json; do
+      if [ -f "$f" ] && grep -q -- "$SRC" "$f"; then
+        sed -E -i "s#(^|[^A-Za-z0-9_.-])$SRC(/|\\$|[^A-Za-z0-9_.-])#\\1$WS\\2#g" "$f" || true
+      fi
+    done
+  done
+fi
 # 2. hide verification material
 rm -rf {hidden} {hidden_repo}
 git config --global user.email agent@example.com
