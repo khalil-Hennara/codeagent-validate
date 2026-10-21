@@ -334,6 +334,17 @@ def test_pull_limit_waits_instead_of_failing():
         _t.time = real
 
 
+def test_every_plan_disables_output_rewriting_pytest_plugins():
+    """pytest-pretty hides the -rA result lines (pydantic images): every route must switch it off."""
+    from codeagent_data.validate.specs import PYTEST_PLAIN, build_plan
+    generic = {**DJANGO_TASK, "instance_id": "pydantic__pydantic-5390", "repo": "pydantic/pydantic",
+               "verifier": "swe_gym", "version": "", "test_patch": DJANGO_TASK["test_patch"]}
+    for task in (DJANGO_TASK, generic):
+        lines = build_plan(task).script.split("\n")
+        assert PYTEST_PLAIN in lines[:3], lines[:3]
+        assert lines[0].startswith("#!") or lines[0] == PYTEST_PLAIN
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

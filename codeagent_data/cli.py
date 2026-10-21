@@ -192,7 +192,48 @@ def main(argv: list[str] | None = None) -> int:
     mrg.add_argument("--tasks", nargs="+", required=True, help="tasks/*.jsonl that were validated")
     mrg.add_argument("--verdicts", nargs="+", required=True, help="verdicts.jsonl files (later ones win)")
     mrg.add_argument("--out", required=True)
+    gen = sub.add_parser("generate", help="stage 4: teacher rollouts (swegemma loop + OpenRouter model) + verification")
+    gen.add_argument("tasks", nargs="+", help="valid_tasks.jsonl from validate/merge")
+    gen.add_argument("--out", required=True)
+    gen.add_argument("--targets", help="targets.json from select (solved target, caps); default: --n and select's defaults")
+    gen.add_argument("--n", type=int, default=2400, help="solved tasks wanted when --targets is not given")
+    gen.add_argument("--shard", help="K/N: this machine takes every N-th task (by rank) and 1/N of the target")
+    gen.add_argument("--prior", nargs="*", default=[], help="results_merged.jsonl of earlier runs (skip + count them)")
+    gen.add_argument("--only", nargs="*", default=[], help="run just these instance ids (debugging)")
+    gen.add_argument("--workers", type=int, default=4, help="tasks in parallel (mostly waiting on the API)")
+    gen.add_argument("--limit", type=int, default=0, help="max new attempts (e.g. 10 for a first test)")
+    gen.add_argument("--max-minutes", type=float, default=None, help="stop starting new tasks after N minutes")
+    gen.add_argument("--prune-images", action="store_true")
+    gen.add_argument("--no-pull", action="store_true")
+    gen.add_argument("--rate-limit-wait", type=float, default=90.0)
+    gen.add_argument("--model", default="moonshotai/kimi-k3", help="OpenRouter model id")
+    gen.add_argument("--reasoning-effort", choices=["low", "medium", "high"], default=None)
+    gen.add_argument("--extra-body", default="", help='JSON added to each request, e.g. \'{"provider": {"sort": "price"}}\'')
+    gen.add_argument("--teacher-dir", default=None, help="agent.yaml + prompts (default: teacher/)")
+    gen.add_argument("--time-minutes", type=float, default=45.0, help="agent time budget per task")
+    gen.add_argument("--tool-calls", type=int, default=100, help="agent tool-call budget per task")
+    gen.add_argument("--turns", type=int, default=300, help="agent LLM-call budget per task")
+    gen.add_argument("--command-timeout", type=int, default=300, help="seconds per run_command")
+    gen.add_argument("--mem", default="6g")
+    gen.add_argument("--cpus", type=float, default=2.0)
+    gen.add_argument("--price-in", type=float, default=0.0, help="USD per 1M prompt tokens (cost estimate only)")
+    gen.add_argument("--price-out", type=float, default=0.0, help="USD per 1M completion tokens")
+    gen.add_argument("--price-cached", type=float, default=None, help="USD per 1M cached prompt tokens")
+
+    gm = sub.add_parser("generate-merge", help="combine generate results (shards + earlier runs) under the global limits")
+    gm.add_argument("--tasks", nargs="+", required=True, help="the valid_tasks.jsonl given to generate")
+    gm.add_argument("--results", nargs="+", required=True, help="results.jsonl / results_merged.jsonl (later win)")
+    gm.add_argument("--targets", help="targets.json from select")
+    gm.add_argument("--n", type=int, default=2400)
+    gm.add_argument("--out", required=True)
     args = ap.parse_args(argv)
+    if args.cmd == "generate":
+        return run_generate(args)
+    if args.cmd == "generate-merge":
+        from .generate.rollout import merge_generation
+        merge_generation(_read_jsonl(args.tasks), [Path(p) for p in args.results],
+                         _load_targets(args.targets, args.n), Path(args.out))
+        return 0
     if args.cmd == "ingest":
         return run_ingest(args)
     if args.cmd == "validate":
@@ -295,6 +336,50 @@ def run_validate(args: argparse.Namespace) -> int:
                    timeout_s=args.timeout, prune_images=args.prune_images, max_minutes=args.max_minutes,
                    retry=tuple(args.retry))
     write_stage1_outputs(tasks, [out / "verdicts.jsonl"], out)
+    return 0
+
+
+def _load_targets(path: str | None, n: int) -> dict:
+    if path and Path(path).exists():
+        return json.loads(Path(path).read_text())
+    from .select import DEFAULT_MAX_SHARE, DEFAULT_SHARES
+    return {"solved_target": n, "shares": dict(DEFAULT_SHARES), "max_share": dict(DEFAULT_MAX_SHARE),
+            "max_per_repo": 120}
+
+
+def run_generate(args: argparse.Namespace) -> int:
+    from .generate.rollout import GenConfig, run_generation, select_shard_tasks, shard_targets
+
+    tasks, n_shards = select_shard_tasks(_read_jsonl(args.tasks), args.shard)
+    if args.only:
+        tasks = [t for t in tasks if t["instance_id"] in set(args.only)]
+    targets = _load_targets(args.targets, args.n)
+    if n_shards > 1:
+        targets = shard_targets(targets, n_shards)
+    cfg = GenConfig(model=args.model, reasoning_effort=args.reasoning_effort,
+                    extra_body=json.loads(args.extra_body) if args.extra_body else {},
+                    time_minutes=args.time_minutes, tool_calls=args.tool_calls, turns=args.turns,
+                    command_timeout=args.command_timeout, mem=args.mem, cpus=args.cpus,
+                    price_in=args.price_in, price_out=args.price_out, price_cached=args.price_cached)
+    if args.teacher_dir:
+        cfg.teacher_dir = Path(args.teacher_dir)
+    prior = _read_jsonl([p for p in args.prior if Path(p).exists()])
+    print(f"generate: {len(tasks)} candidate tasks, target {targets['solved_target']} solved"
+          + (f" (shard {args.shard})" if args.shard else "") + f", model {cfg.model}", flush=True)
+
+    def factory():
+        from .validate.docker_runner import DockerRunner
+        # verification containers get network like stage 1; the agent's container never does
+        return DockerRunner(mem_limit=args.mem, cpus=args.cpus, pull=not args.no_pull, workers=args.workers,
+                            rate_limit_wait_minutes=args.rate_limit_wait)
+
+    out = Path(args.out)
+    run_generation(tasks, targets, cfg, out, runner_factory=factory, workers=args.workers, limit=args.limit,
+                   max_minutes=args.max_minutes, prune_images=args.prune_images, prior=prior)
+    from .generate.rollout import render_generation_report
+    rows = _read_jsonl([str(out / "results.jsonl")]) if (out / "results.jsonl").exists() else []
+    (out / "generation_report.md").write_text(render_generation_report(rows, targets), encoding="utf-8")
+    print((out / "generation_report.md").read_text())
     return 0
 
 

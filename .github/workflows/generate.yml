@@ -1,0 +1,198 @@
+# Stage 4 (generate): teacher rollouts on GitHub-hosted runners, one job per shard, merged at the end.
+#
+# The teacher model runs on OpenRouter, so the runner only hosts the task containers: the agent's
+# own container (each task's image, network off) and a fresh container that runs the task's tests
+# on the teacher's patch. Each shard takes every N-th task in rank order and aims for 1/N of the
+# solved target; the merge applies the global per-source / per-repo limits.
+#
+# First run: num_shards=1, limit=10 -> 10 tasks, then read the report (cost, solve rate, reasoning).
+#
+# Needs (Settings -> Secrets and variables -> Actions):
+#   secrets   OPENROUTER_API_KEY,
+#             KAGGLE_USERNAME + KAGGLE_KEY, or KAGGLE_API_TOKEN (the harness wheels come from the organizers' public
+#               Kaggle dataset metric/gemma-4-developer-agent-wheelhouse, never from this repo),
+#             DOCKERHUB_USERNAME + DOCKERHUB_TOKEN (optional, avoids pull limits)
+#   optional  variable HARNESS_REPO + secret HARNESS_TOKEN: take the harness from a private repo instead
+# Task files: data/gen/part-*.jsonl (valid tasks, rank order) and data/targets.json, see README.
+# To continue after a run: download the `generated` artifact, commit its results_merged.jsonl as
+# data/gen_done.jsonl and run again (finished tasks are skipped, their solves count).
+
+name: generate-trajectories
+
+on:
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: "Valid task files (shell glob)"
+        default: "data/gen/*.jsonl"
+      num_shards:
+        description: "Parallel jobs (first test: 1; full run: 20)"
+        default: "1"
+      limit:
+        description: "Max new attempts per job (first test: 10; 0 = until the target or max_minutes)"
+        default: "10"
+      workers:
+        description: "Tasks per job in parallel (they mostly wait on the API)"
+        default: "4"
+      max_minutes:
+        description: "Stop starting new tasks after N minutes (jobs are killed at 360)"
+        default: "290"
+      model:
+        description: "OpenRouter model id"
+        default: "moonshotai/kimi-k3"
+      reasoning_effort:
+        description: "low | medium | high | empty = model default"
+        default: ""
+      extra_body:
+        description: 'JSON added to every request, e.g. {"provider": {"sort": "price"}}'
+        default: ""
+      prices:
+        description: "USD per 1M tokens 'input output cached' (for the cost estimate only)"
+        default: "0 0 0"
+      time_minutes:
+        description: "Agent time budget per task (minutes)"
+        default: "45"
+
+# results of earlier runs (committed by you, see the header): finished tasks are skipped
+env:
+  PRIOR: data/gen_done.jsonl
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.mk.outputs.shards }}
+    steps:
+      - id: mk
+        env:
+          N: ${{ inputs.num_shards }}
+        run: python3 -c "import json, os; print('shards=' + json.dumps(list(range(int(os.environ['N'])))))" >> "$GITHUB_OUTPUT"
+
+  generate:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      HARNESS_REPO: ${{ vars.HARNESS_REPO }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Fetch the harness (private repo)
+        if: env.HARNESS_REPO != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HARNESS_REPO }}
+          token: ${{ secrets.HARNESS_TOKEN }}
+          path: harness_src
+          lfs: true
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af > /dev/null
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install -r requirements-generate.txt
+
+      - name: Fetch the harness wheels (organizers' Kaggle dataset)
+        if: env.HARNESS_REPO == ''
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          # either a legacy kaggle.json (username + key) or a new API token; drop the unset one
+          [ -n "$KAGGLE_API_TOKEN" ] || unset KAGGLE_API_TOKEN
+          [ -n "$KAGGLE_USERNAME" ] || unset KAGGLE_USERNAME KAGGLE_KEY
+          pip install -q kaggle
+          python scripts/fetch_harness.py harness_src
+
+      - name: Install the harness
+        run: |
+          bash scripts/setup_harness.sh harness_src harness
+          rm -rf harness_src
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate shard ${{ matrix.shard }}
+        env:
+          PYTHONPATH: harness
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          SHARD: ${{ matrix.shard }}
+          N: ${{ inputs.num_shards }}
+          TASKS: ${{ inputs.tasks }}
+          LIMIT: ${{ inputs.limit }}
+          WORKERS: ${{ inputs.workers }}
+          MAX_MIN: ${{ inputs.max_minutes }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.reasoning_effort }}
+          EXTRA: ${{ inputs.extra_body }}
+          PRICES: ${{ inputs.prices }}
+          TIME_MIN: ${{ inputs.time_minutes }}
+        run: |
+          read -r P_IN P_OUT P_CACHED <<< "$PRICES"
+          targets=(); [ -f data/targets.json ] && targets=(--targets data/targets.json)
+          effort=(); [ -n "$EFFORT" ] && effort=(--reasoning-effort "$EFFORT")
+          # $TASKS is a glob on purpose: let the shell expand it
+          python -m codeagent_data generate $TASKS "${targets[@]}" "${effort[@]}" \
+            --shard "$SHARD/$N" --out "out/shard_$SHARD" --prior "$PRIOR" \
+            --workers "$WORKERS" --limit "$LIMIT" --max-minutes "$MAX_MIN" --prune-images \
+            --model "$MODEL" --extra-body "$EXTRA" --time-minutes "$TIME_MIN" \
+            --price-in "${P_IN:-0}" --price-out "${P_OUT:-0}" --price-cached "${P_CACHED:-0}"
+          cat "out/shard_$SHARD/generation_report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gen-shard-${{ matrix.shard }}
+          path: out/shard_${{ matrix.shard }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  merge:
+    needs: generate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gen-shard-*
+          path: shards
+      - name: Merge shards (+ earlier runs) under the global limits
+        env:
+          TASKS: ${{ inputs.tasks }}
+        run: |
+          prev=(); [ -f "$PRIOR" ] && prev=("$PRIOR")
+          targets=(); [ -f data/targets.json ] && targets=(--targets data/targets.json)
+          python -m codeagent_data generate-merge --tasks $TASKS "${targets[@]}" \
+            --results "${prev[@]}" shards/*/results.jsonl --out out/generated
+          cat out/generated/generation_report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: generated
+          path: out/generated
+          retention-days: 90

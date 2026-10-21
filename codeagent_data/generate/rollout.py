@@ -1,0 +1,492 @@
+"""Teacher rollouts: swegemma's own agent loop, on each task's image, with an OpenRouter model.
+
+What is reused unchanged from swegemma (so trajectories match what Gemma sees at inference):
+the 6 tools and their output limits, the task prompt (`build_agent_prompt`), continuation
+nudges, budgets, patch extraction (`submit_patch` / working-tree fallback), stripping of edits
+to test/config files, and the SessionTrace format (thinking, text, tool calls, tool results,
+token usage).
+
+What is replaced: swegemma prepares its universal py3.13 image from a snapshot + wheels. Here
+the task's own image is used, so those steps become no-ops and `ImageTaskSandbox` prepares the
+container instead (see prepare.py). Only git-exclude + the baseline commit run as in swegemma.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import os
+import threading
+import time
+from collections import Counter
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+from ..jsonl import iter_jsonl
+from ..validate.specs import UnsupportedVerifier, build_plan
+from ..validate.validator import judge
+from .prepare import SETUP_PATCH_PATH, prepare_script
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_TEACHER_DIR = ROOT / "teacher"
+AGENT_PATH = ("/workspace/.venv/bin:/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:"
+              "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+# errors worth a later retry (not the task's fault) / errors that must stop the whole run
+RETRYABLE = ("IMAGE_UNAVAILABLE", "INFRA_ERROR", "PREPARE_FAILED", "API_ERROR")
+_API_ERRORS = ("RateLimitError", "APIConnectionError", "ServiceUnavailable", "InternalServerError",
+               "Timeout", "APIError", "BadGateway", "overloaded")
+_FATAL_ERRORS = ("AuthenticationError", "401", "402", "insufficient", "Insufficient credits")
+
+
+@dataclass
+class GenConfig:
+    model: str = "moonshotai/kimi-k3"
+    api_key_env: str = "OPENROUTER_API_KEY"
+    api_base: str | None = None  # default: OpenRouter (tests point this at a local fake server)
+    reasoning_effort: str | None = None  # "low" | "medium" | "high"; None = the model's default
+    extra_body: dict[str, Any] = field(default_factory=dict)  # e.g. {"provider": {"sort": "price"}}
+    teacher_dir: Path = DEFAULT_TEACHER_DIR
+    time_minutes: float = 45.0
+    tool_calls: int = 100
+    turns: int = 300
+    command_timeout: int = 300
+    mem: str = "8g"
+    cpus: float = 2.0
+    # USD per 1M tokens, only for the cost estimate in the report
+    price_in: float = 0.0
+    price_out: float = 0.0
+    price_cached: float | None = None
+
+
+# ---------------------------------------------------------------------------------------------
+# swegemma glue
+
+
+def _patched_agent_runner():
+    """swegemma's agent runner with its snapshot/wheels/setup.py preparation switched off."""
+    import swegemma.harness.agent_runner as ar
+
+    def noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    for name in ("setup_container_wheels", "extract_snapshot", "install_editable_package",
+                 "install_test_dependencies", "setup_workspace_test_config"):
+        setattr(ar, name, noop)
+    return ar
+
+
+def build_eval_config(cfg: GenConfig, out: Path, model_override: Any = None):
+    from adk_submission import GenerationConstraints, ModelRegistry
+    from swegemma.budget import EvaluationBudget, HarnessLimits
+    from swegemma.config import EvalConfig
+
+    models = ModelRegistry()
+    if model_override is not None:  # tests
+        models.register("teacher", model_override)
+    else:
+        from google.adk.models.lite_llm import LiteLlm
+
+        key = os.environ.get(cfg.api_key_env)
+        if not key:
+            raise SystemExit(f"set {cfg.api_key_env} (the OpenRouter API key)")
+        # litellm's openrouter provider maps OpenRouter's `reasoning` field to reasoning_content,
+        # which ADK turns into thought parts -> "thinking" entries in the trace
+        kwargs: dict[str, Any] = {"api_key": key, "num_retries": 5}
+        if cfg.api_base:
+            kwargs["api_base"] = cfg.api_base
+        body = dict(cfg.extra_body)
+        if cfg.reasoning_effort:  # OpenRouter's unified reasoning parameter
+            body.setdefault("reasoning", {})["effort"] = cfg.reasoning_effort
+        if body:
+            kwargs["extra_body"] = body
+        models.register("teacher", LiteLlm(model=f"openrouter/{cfg.model}", **kwargs))
+    return EvalConfig(
+        tasks_path=out / "tasks.jsonl", snapshots_dir=out, results_dir=out,
+        submission_dir=Path(cfg.teacher_dir), models=models,
+        budget=EvaluationBudget(time_minutes=cfg.time_minutes, tool_calls=cfg.tool_calls, turns=cfg.turns),
+        harness=HarnessLimits(command_timeout_seconds=cfg.command_timeout),
+        generation_constraints=GenerationConstraints(defaults={}),  # no injected thinking budget
+        display_mode="quiet", enable_sandbox_testing=True,
+    )
+
+
+def swegemma_task(t: dict[str, Any]):
+    from swegemma.models import Task
+
+    return Task(instance_id=t["instance_id"], repo=t["repo"], base_commit=t.get("base_commit") or "",
+                problem_statement=t["problem_statement"], patch="", test_patch=t.get("test_patch") or "",
+                hints_text="")
+
+
+def make_image_sandbox(task: dict[str, Any], cfg: GenConfig, put_file: Callable[..., None]):
+    """A swegemma ContainerManager for this task's image that prepares the workspace on start."""
+    from swegemma.harness.container_setup import ContainerSetupError
+    from swegemma.sandbox import ContainerConfig, ContainerManager
+
+    class ImageTaskSandbox(ContainerManager):
+        def start(self) -> str:
+            cid = super().start()
+            setup = (task.get("setup_patch") or "").strip()
+            if setup:
+                put_file(self.client.containers.get(cid), SETUP_PATCH_PATH, task["setup_patch"])
+            script = prepare_script(task.get("env_workdir") or "/testbed", "/workspace", has_setup_patch=bool(setup))
+            res = self.exec(cid, script, timeout=900)
+            if res.exit_code != 0 or "PREPARE_OK" not in (res.stdout or ""):
+                self.stop(cid)
+                raise ContainerSetupError(f"PREPARE_FAILED: {(res.stderr or res.stdout)[-800:]}")
+            return cid
+
+    sb = ImageTaskSandbox(ContainerConfig(
+        image=task["env_image"], network_mode="none", mem_limit=cfg.mem,
+        cpu_quota=int(cfg.cpus * 100_000), working_dir="/workspace", timeout_seconds=cfg.command_timeout,
+        environment={"TEST_TMPDIR": "/tmp", "PATH": AGENT_PATH},
+    ))
+    sb._image_resolved = True  # the image was pulled already (rate-limit aware), don't re-resolve
+    return sb
+
+
+def trace_stats(trace: Any) -> dict[str, int]:
+    st = Counter()
+    for e in trace.entries if trace is not None else []:
+        u = getattr(e, "usage", None) or {}
+        st["prompt_tokens"] += int(u.get("prompt_tokens") or 0)
+        # largest single request = the context length the trajectory reaches (matters for the student)
+        st["max_context_tokens"] = max(st["max_context_tokens"], int(u.get("prompt_tokens") or 0))
+        st["completion_tokens"] += int(u.get("completion_tokens") or 0)
+        st["cached_tokens"] += int(u.get("cached_tokens") or 0)
+        et = getattr(e, "event_type", "")
+        st["tool_calls"] += et == "tool_call"
+        st["thinking_entries"] += et == "thinking"
+    return dict(st)
+
+
+def save_trace(trace: Any, out: Path, instance_id: str) -> str | None:
+    """Raw entry list ("legacy" format): keeps thinking / text / tool_call / tool_response / usage
+    apart, which the SFT parser needs (the ATIF export merges thinking into the message text)."""
+    if trace is None:
+        return None
+    path = out / "traces" / f"{instance_id.replace('/', '__')}.json"
+    trace.save(path, format="legacy")
+    return str(path.relative_to(out))  # relative to the run folder, so shard artifacts can move
+
+
+def estimate_cost(st: dict[str, int], cfg: GenConfig) -> float:
+    cached = st.get("cached_tokens", 0)
+    price_cached = cfg.price_in if cfg.price_cached is None else cfg.price_cached
+    uncached = max(0, st.get("prompt_tokens", 0) - cached)
+    return (uncached * cfg.price_in + cached * price_cached + st.get("completion_tokens", 0) * cfg.price_out) / 1e6
+
+
+def classify_agent_error(err: str | None) -> str | None:
+    if not err:
+        return None
+    if any(k in err for k in _FATAL_ERRORS):
+        return "FATAL_API_ERROR"
+    if "PREPARE_FAILED" in err:
+        return "PREPARE_FAILED"
+    if any(k in err for k in _API_ERRORS):
+        return "API_ERROR"
+    return None
+
+
+# ---------------------------------------------------------------------------------------------
+# one task
+
+
+@dataclass
+class Attempt:
+    instance_id: str
+    uid: str = ""
+    verifier: str = ""
+    repo: str = ""
+    fold: str = ""
+    selection_rank: int = -1
+    solved: bool = False
+    reason: str = ""
+    agent_error: str | None = None
+    patch: str = ""
+    seconds: float = 0.0
+    est_cost_usd: float = 0.0
+    stats: dict[str, int] = field(default_factory=dict)
+    trace_path: str | None = None
+    model: str = ""
+
+
+def verify_patch(task: dict[str, Any], patch: str, runner: Any, timeout_s: int = 1800) -> tuple[bool, str]:
+    """Run the task's tests on base + (setup) + teacher patch in a fresh container."""
+    try:
+        plan = build_plan(task)
+    except UnsupportedVerifier as e:
+        return False, f"UNSUPPORTED: {e}"
+    setup = [("setup", task["setup_patch"])] if (task.get("setup_patch") or "").strip() else []
+    res = runner.run(task["env_image"], plan.script, workdir=plan.workdir,
+                     patches=setup + [("agent", patch)], timeout_s=timeout_s)
+    if res.stage == "agent_apply":
+        return False, "AGENT_PATCH_APPLY_FAIL"
+    if res.stage == "timeout":
+        return False, "TIMEOUT (verification)"
+    if res.stage != "done":
+        return False, f"INFRA_ERROR: verification stopped at {res.stage}"
+    v = judge(task, plan, "", [res.log])
+    return v.valid, ("SOLVED" if v.valid else v.reason)
+
+
+def run_one(task: dict[str, Any], cfg: GenConfig, out: Path, runner: Any, *,
+            sandbox_factory: Callable[[dict[str, Any]], Any] | None = None,
+            model_override: Any = None) -> Attempt:
+    t0 = time.time()
+    a = Attempt(task["instance_id"], task.get("uid", ""), task.get("verifier", ""), task.get("repo", ""),
+                task.get("fold", ""), int(task.get("selection_rank", -1)), model=cfg.model)
+    if sandbox_factory is None:
+        err = runner.ensure_image(task["env_image"])
+        if err:
+            a.reason, a.seconds = f"IMAGE_UNAVAILABLE: {err[:300]}", time.time() - t0
+            return a
+        sandbox = make_image_sandbox(task, cfg, runner._put)
+    else:
+        sandbox = sandbox_factory(task)
+    ar = _patched_agent_runner()
+    econf = build_eval_config(cfg, out, model_override)
+    try:
+        patch, agent_error, trace = asyncio.run(
+            ar.run_agent_sandbox(sandbox, econf, swegemma_task(task), Path("/dev/null")))
+    except Exception as e:  # noqa: BLE001  (ContainerSetupError, docker errors, ...)
+        a.reason = "PREPARE_FAILED" if "PREPARE_FAILED" in str(e) else f"INFRA_ERROR: {str(e)[:300]}"
+        a.agent_error, a.seconds = str(e)[:2000], time.time() - t0
+        return a
+    a.agent_error, a.patch = agent_error, patch or ""
+    a.stats = trace_stats(trace)
+    a.est_cost_usd = round(estimate_cost(a.stats, cfg), 4)
+    a.trace_path = save_trace(trace, out, task["instance_id"])
+    kind = classify_agent_error(agent_error)
+    if kind:
+        a.reason = f"{kind}: {agent_error[:300]}"
+    elif not a.patch.strip():
+        a.reason = "NO_PATCH" + (f": {agent_error[:200]}" if agent_error else "")
+    else:
+        a.solved, a.reason = verify_patch(task, a.patch, runner)
+    a.seconds = time.time() - t0
+    return a
+
+
+# ---------------------------------------------------------------------------------------------
+# many tasks, in parallel, until the solved target is reached
+
+
+def shard_targets(targets: dict[str, Any], num_shards: int, margin: float = 0.05) -> dict[str, Any]:
+    """Each shard aims for its slice of the target (+margin); merge applies the global limits."""
+    t = dict(targets)
+    t["solved_target"] = math.ceil(targets["solved_target"] * (1 + margin) / num_shards)
+    t["max_per_repo"] = max(1, math.ceil(targets["max_per_repo"] * (1 + margin) / num_shards))
+    t["max_share"] = dict(targets["max_share"])
+    return t
+
+
+def select_shard_tasks(tasks: list[dict[str, Any]], shard: str | None) -> tuple[list[dict[str, Any]], int]:
+    """Rank-ordered tasks; shard K/N takes every N-th task so every shard gets the same mix."""
+    tasks = sorted(tasks, key=lambda t: int(t.get("selection_rank", 1 << 30)))
+    if not shard:
+        return tasks, 1
+    k, n = (int(x) for x in shard.split("/"))
+    return tasks[k::n], n
+
+
+def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: GenConfig, out: Path, *,
+                   runner_factory: Callable[[], Any], workers: int = 4, limit: int = 0,
+                   max_minutes: float | None = None, prune_images: bool = False,
+                   prior: list[dict[str, Any]] | None = None,
+                   sandbox_factory: Callable[[dict[str, Any]], Any] | None = None,
+                   model_override: Any = None) -> list[Attempt]:
+    """`prior`: results of earlier runs (e.g. results_merged.jsonl). Those of these `tasks` that
+    finished are skipped and their solved ones count toward the target."""
+    from ..select import should_attempt
+
+    out.mkdir(parents=True, exist_ok=True)
+    results_fp = out / "results.jsonl"
+    mine = {t["instance_id"] for t in tasks}
+    done: dict[str, dict[str, Any]] = {}
+    earlier = [r for r in prior or [] if r["instance_id"] in mine]
+    if results_fp.exists():  # resumable: keep finished attempts, retry infrastructure failures
+        earlier += list(iter_jsonl(results_fp))
+    for r in earlier:
+        if is_final(r):
+            done[r["instance_id"]] = r
+    solved_src = Counter(r["verifier"] for r in done.values() if r.get("solved"))
+    solved_repo = Counter((r.get("repo") or "").lower() for r in done.values() if r.get("solved"))
+    queue = [t for t in tasks if t["instance_id"] not in done]
+    runner = runner_factory()
+    lock = threading.Lock()
+    state = {"next": 0, "started": 0, "stop": None}
+    t0 = time.time()
+    results: list[Attempt] = []
+
+    def next_task() -> dict[str, Any] | None:
+        with lock:
+            while True:
+                if state["stop"]:
+                    return None
+                if sum(solved_src.values()) >= targets["solved_target"]:
+                    state["stop"] = "solved target reached"
+                    return None
+                if max_minutes and time.time() - t0 > max_minutes * 60:
+                    state["stop"] = "--max-minutes reached"
+                    return None
+                if limit and state["started"] >= limit:
+                    state["stop"] = "--limit reached"
+                    return None
+                if state["next"] >= len(queue):
+                    state["stop"] = "no tasks left"
+                    return None
+                t = queue[state["next"]]
+                state["next"] += 1
+                if should_attempt(t, solved_src, solved_repo, targets):
+                    state["started"] += 1
+                    return t
+
+    def worker() -> None:
+        while True:
+            t = next_task()
+            if t is None:
+                return
+            try:
+                a = run_one(t, cfg, out, runner, sandbox_factory=sandbox_factory, model_override=model_override)
+            except Exception as e:  # noqa: BLE001
+                a = Attempt(t["instance_id"], t.get("uid", ""), t.get("verifier", ""), t.get("repo", ""),
+                            reason=f"INFRA_ERROR: {str(e)[:300]}")
+            if prune_images and t.get("env_image") and sandbox_factory is None:
+                runner.remove_image(t["env_image"])
+            with lock:
+                if a.solved:
+                    solved_src[a.verifier] += 1
+                    solved_repo[a.repo.lower()] += 1
+                if a.reason.startswith("FATAL_API_ERROR"):
+                    state["stop"] = f"fatal API error, stopping: {a.reason[:200]}"
+                with results_fp.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(asdict(a), ensure_ascii=False) + "\n")
+                results.append(a)
+                n_solved = sum(solved_src.values())
+                el = (time.time() - t0) / 60
+                print(f"[{el:.0f} min] {a.instance_id}: {a.reason[:120]}  "
+                      f"(solved {n_solved}/{targets['solved_target']}, ~${a.est_cost_usd:.2f})", flush=True)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, workers))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    print(f"stopped: {state['stop']}", flush=True)
+    return results
+
+
+def is_final(r: dict[str, Any]) -> bool:
+    return not str(r.get("reason", "")).startswith(RETRYABLE + ("FATAL_API_ERROR",))
+
+
+def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any] | None = None) -> str:
+    by_src: dict[str, Counter] = {}
+    reasons: Counter[str] = Counter()
+    cost = tokens_in = tokens_out = cached = secs = 0.0
+    n_calls = n_think = 0
+    ctx: list[int] = []
+    final = [r for r in rows if is_final(r)]
+    for r in final:
+        c = by_src.setdefault(r.get("verifier") or "?", Counter())
+        c["attempted"] += 1
+        c["solved"] += bool(r.get("solved"))
+        reasons[str(r.get("reason", "")).split(":")[0].split(" (")[0]] += 1
+        cost += float(r.get("est_cost_usd") or 0)
+        st = r.get("stats") or {}
+        tokens_in += st.get("prompt_tokens", 0)
+        tokens_out += st.get("completion_tokens", 0)
+        cached += st.get("cached_tokens", 0)
+        n_calls += st.get("tool_calls", 0)
+        n_think += st.get("thinking_entries", 0)
+        ctx.append(st.get("max_context_tokens", 0))
+        secs += float(r.get("seconds") or 0)
+    n, solved = len(final), sum(bool(r.get("solved")) for r in final)
+    lines = ["# Generation report", "", f"attempts: {n}  solved: {solved}"
+             + (f"  ({solved / n:.0%})" if n else ""), ""]
+    lines += ["| source | attempted | solved | rate |", "| --- | --- | --- | --- |"]
+    for s, c in sorted(by_src.items()):
+        lines.append(f"| {s} | {c['attempted']} | {c['solved']} | {c['solved'] / max(1, c['attempted']):.0%} |")
+    lines += ["", "## Outcomes", ""] + [f"- {k}: {v}" for k, v in reasons.most_common()]
+    if n:
+        lines += ["", "## Cost and time (per attempt)", "",
+                  f"- prompt tokens: {tokens_in / n:,.0f} (cached {cached / max(1, tokens_in):.0%})   "
+                  f"completion tokens: {tokens_out / n:,.0f}",
+                  f"- longest context per attempt: median {sorted(ctx)[len(ctx) // 2]:,} tokens, max {max(ctx):,}",
+                  f"- tool calls: {n_calls / n:.1f}   reasoning blocks captured: {n_think / n:.1f}"
+                  + ("   <-- NO REASONING CAPTURED: check the model/provider" if n_calls and not n_think else ""),
+                  f"- estimated cost: ${cost / n:.3f} per attempt, ${cost / max(1, solved):.3f} per solved task"
+                  + ("" if cost else "  (pass --price-in/--price-out to estimate)"),
+                  f"- wall time: {secs / n / 60:.1f} min per attempt"]
+        if targets and solved:
+            need = targets["solved_target"]
+            lines.append(f"- projection for {need} solved: ~{need / (solved / n):,.0f} attempts, "
+                         f"~${need * cost / solved:,.2f}")
+    retry = [r for r in rows if r not in final]
+    if retry:
+        lines += ["", f"{len(retry)} attempts hit infrastructure/API errors and will be retried on the next run."]
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------------------------
+# merge shards / runs
+
+
+def merge_generation(tasks: list[dict[str, Any]], result_files: list[Path], targets: dict[str, Any],
+                     out: Path) -> dict[str, int]:
+    """Combine results from shards and earlier runs (later files win) and apply the GLOBAL limits:
+    solved tasks are accepted in selection-rank order while their source / repo is under its cap.
+
+    Writes results_merged.jsonl (pass as --prior next time), solved.jsonl (task + teacher patch +
+    trace path; the SFT input), traces/ for the accepted tasks, and generation_report.md."""
+    import shutil
+
+    from ..select import should_attempt
+
+    rows: dict[str, dict[str, Any]] = {}
+    trace_src: dict[str, Path] = {}
+    for fp in result_files:
+        if not fp.exists():
+            continue
+        for r in iter_jsonl(fp):
+            old = rows.get(r["instance_id"])
+            if old is not None and is_final(old) and not is_final(r):
+                continue  # never replace a finished attempt by a later infrastructure failure
+            rows[r["instance_id"]] = r
+            if r.get("trace_path") and (fp.parent / r["trace_path"]).exists():
+                trace_src[r["instance_id"]] = fp.parent / r["trace_path"]
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / "results_merged.jsonl").open("w", encoding="utf-8") as f:
+        for r in rows.values():
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    by_id = {t["instance_id"]: t for t in tasks}
+    solved = sorted((r for r in rows.values() if r.get("solved") and r["instance_id"] in by_id),
+                    key=lambda r: int(by_id[r["instance_id"]].get("selection_rank", 1 << 30)))
+    src_c: Counter[str] = Counter()
+    repo_c: Counter[str] = Counter()
+    accepted = 0
+    (out / "traces").mkdir(exist_ok=True)
+    with (out / "solved.jsonl").open("w", encoding="utf-8") as f:
+        for r in solved:
+            t = by_id[r["instance_id"]]
+            if not should_attempt(t, src_c, repo_c, targets):
+                continue
+            src_c[t.get("verifier") or ""] += 1
+            repo_c[(t.get("repo") or "").lower()] += 1
+            accepted += 1
+            trace = None
+            if r["instance_id"] in trace_src:
+                trace = f"traces/{trace_src[r['instance_id']].name}"
+                shutil.copy2(trace_src[r["instance_id"]], out / trace)
+            teacher = {k: r.get(k) for k in ("model", "patch", "stats", "est_cost_usd", "seconds", "agent_error")}
+            f.write(json.dumps({**t, "teacher": {**teacher, "trace": trace}}, ensure_ascii=False) + "\n")
+    report = render_generation_report(list(rows.values()), targets)
+    report += f"\naccepted under the global limits (solved.jsonl): {accepted} of {targets['solved_target']}\n"
+    report += "".join(f"- {s}: {c}\n" for s, c in sorted(src_c.items()))
+    (out / "generation_report.md").write_text(report, encoding="utf-8")
+    print(report)
+    return {"rows": len(rows), "solved": len(solved), "accepted": accepted}

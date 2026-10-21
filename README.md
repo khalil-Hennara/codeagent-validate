@@ -14,9 +14,9 @@ generating teacher trajectories with the swegemma harness.
 2.  ingest   : checks every row against its repo, no Docker       ─► tasks/*.jsonl
 2b. select   : ranks tasks so the first N solved are the best mix  ─► ranked.jsonl, targets.json
 3.  validate : runs the tests in each task's image, no model       ─► valid_tasks.jsonl
-4.  rollouts : teacher model + swegemma tools                       (next, not built)
-5.  verify   : re-run the tests on the teacher's patch              (next)
-6.  parse    : localizer / fixer / scoring records                  (next)
+4.  generate : teacher (OpenRouter) + swegemma loop in each image,  ─► solved.jsonl + traces/
+               then the task's tests on the teacher's patch
+5.  parse    : localizer / fixer / scoring records                  (next)
 ```
 
 `ingest` and `validate` run **one task per worker in parallel** and are **resumable** where it matters.
@@ -422,16 +422,127 @@ besides the output file. Rules of thumb for `validate`:
 
 ---
 
-## 4–6. Next (not built yet)
+## 4. Teacher trajectories: `generate` (Docker + an OpenRouter model)
 
-- **Rollouts:** run the teacher with swegemma's tools (`run_command, read_file, edit_file,
-  write_file, submit_patch, get_status`; graph tools omitted) inside each image. Before the
-  baseline commit: git is re-initialised at `base_commit` (images keep history that would
-  reveal the fix), the setup patch is committed, and R2E's `run_tests.sh`/`r2e_tests` are
-  moved out of reach. Reasoning from an open teacher arrives as `thinking` entries in the trace.
-- **Verify:** strip edits to test/config files (as the competition does), then run the same
-  base/gold logic as step 3 on the teacher's patch.
-- **Parse:** y\*, L_edit, L_view, search queries and reasoning, for the localizer/fixer plan.
+For each task, in rank order, until the solved target is reached:
+
+1. **Agent container** from the task's own image, **network off**. Before the agent starts
+   (`generate/prepare.py`): the repo moves to `/workspace` (old path kept as a symlink so
+   editable installs work); R2E's hidden tests and runner are deleted; every git ref that is not
+   an ancestor of HEAD (upstream branches with the real fix, future tags, remotes, reflogs) is
+   removed and pruned; for SWE-smith the bug (setup patch) is applied and folded into the base
+   commit.
+2. **swegemma's own agent loop** (`run_agent_sandbox`): same tools and output limits, same task
+   prompt, nudges, budgets, `submit_patch`, stripping of test/config edits, same trace. Only
+   swegemma's snapshot/wheels/`setup.py` preparation is switched off. Graph tools are not given.
+   The teacher's instructions are in `teacher/` (`agent.yaml`, `prompts/system.md`).
+3. **Verification** in a fresh container: setup patch + teacher patch + the task's tests, judged
+   with the stage 3 lists: every FAIL_TO_PASS and PASS_TO_PASS test must pass → `SOLVED`.
+
+Outputs per run folder: `results.jsonl` (one row per attempt: outcome, patch, tokens, cost
+estimate), `traces/<id>.json` (raw entries: `thinking` = the teacher's reasoning, `text`,
+`tool_call`, `tool_response`, `usage`), `logs/`, `generation_report.md`.
+`generate-merge` combines shards and runs under the **global** per-source / per-repo limits
+into `solved.jsonl` (task + `teacher: {patch, trace, stats, ...}`), the input of step 5.
+
+The model is called through litellm's OpenRouter provider: OpenRouter's `reasoning` field
+becomes `thinking` entries and is sent back on later turns. `tests/test_openrouter_wire.py`
+checks this against a local fake OpenRouter server.
+
+### Where to run it
+
+| | |
+| --- | --- |
+| **GitHub Actions** (recommended) | ✅ the model runs at OpenRouter, so the runner only hosts containers; 20 jobs × 4 tasks in parallel |
+| **Colab** | ❌ no Docker daemon, and every task needs its image |
+| Your laptop / a VM with Docker | ✅ for a few tasks (same command as below) |
+
+### The harness comes from the organizers' Kaggle dataset
+
+The harness (`swegemma`, `adk_eval_core`, `adk_submission`) has no license file, so it is **not**
+put in this public repository. The workflow downloads its wheels at run time from the organizers'
+public dataset [metric/gemma-4-developer-agent-wheelhouse](https://www.kaggle.com/datasets/metric/gemma-4-developer-agent-wheelhouse)
+(`scripts/fetch_harness.py`, only the harness wheels, not vLLM/torch) and unpacks them with
+`scripts/setup_harness.sh`. The log prints the google-adk / litellm versions found there, so
+you can compare them with `requirements-generate.txt`.
+
+1. kaggle.com → your profile → **Settings** → **API** → **Create New Token**. You get either a
+   `kaggle.json` (`username` + `key`) or an API token string. The account must have accepted the
+   competition rules.
+2. In `codeagent-validate` → Settings → Secrets and variables → Actions → **Secrets**:
+   `KAGGLE_USERNAME` + `KAGGLE_KEY` (from kaggle.json) **or** `KAGGLE_API_TOKEN`, and
+   `OPENROUTER_API_KEY` (keep `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` from stage 3).
+
+Alternative: a private repository with the harness zips, set as variable `HARNESS_REPO` with a
+read-only token in secret `HARNESS_TOKEN`; when `HARNESS_REPO` is set it is used instead.
+
+### Task files (from Colab)
+
+```bash
+cd /content/codeagent-validate
+# valid tasks from the validate run (artifact `stage1`), in rank order, split under 40 MB
+python scripts/make_task_files.py /content/stage1/valid_tasks.jsonl --head 100000 --out data/gen
+cp /content/codeagent_data/out/select/targets.json data/targets.json    # solved target + caps
+git add data/gen data/targets.json && git commit -m "generation tasks" && git push
+```
+
+### First test: 10 tasks
+
+Actions → **generate-trajectories** → Run workflow with `num_shards=1`, `limit=10` (defaults),
+and `prices` = the model's OpenRouter prices per 1M tokens `input output cached` (copy them from
+the model page; they only feed the cost estimate). Optional: `reasoning_effort`, and
+`extra_body` such as `{"provider": {"sort": "price"}}`.
+
+The job summary shows the report. Check before scaling:
+- **reasoning blocks captured** > 0 (otherwise the provider returns no reasoning),
+- **cost per solved task** and the **projection** for 2,400,
+- **longest context per attempt** (what the student must fit),
+- the `generated` artifact: open a few `traces/*.json` and `solved.jsonl`.
+
+### Full run
+
+`num_shards=20`, `limit=0`. Each job stops starting tasks after `max_minutes` (default 290)
+or when its share of the target is solved. To continue: download the `generated` artifact,
+commit its `results_merged.jsonl` as `data/gen_done.jsonl`, run again (finished tasks are
+skipped and their solves count). Keep every run's `generated` artifact: each holds the traces of
+the tasks it solved. Final assembly, locally or on Colab:
+
+```bash
+python -m codeagent_data generate-merge --tasks data/gen/*.jsonl --targets data/targets.json \
+    --results run1/results_merged.jsonl run2/results_merged.jsonl run3/results_merged.jsonl --out out/final
+```
+
+### Locally (any machine with Docker)
+
+```bash
+pip install -r requirements-generate.txt kaggle
+python scripts/fetch_harness.py harness_src        # needs KAGGLE_USERNAME + KAGGLE_KEY (or KAGGLE_API_TOKEN)
+bash scripts/setup_harness.sh harness_src harness && export PYTHONPATH=harness
+export OPENROUTER_API_KEY=...
+python -m codeagent_data generate data/gen/*.jsonl --targets data/targets.json --out out/gen \
+    --limit 10 --workers 2 --price-in 0.6 --price-out 2.5 --price-cached 0.15
+```
+
+Useful flags: `--only <instance_id>` (one task), `--time-minutes`, `--tool-calls`, `--turns`,
+`--model`, `--reasoning-effort`, `--extra-body`, `--prior` (results of earlier runs).
+
+| outcome | meaning |
+| --- | --- |
+| `SOLVED` | all FAIL_TO_PASS + PASS_TO_PASS pass with the teacher's patch |
+| `GOLD_FAILS_F2P` / `GOLD_BREAKS_P2P` | the teacher's patch does not fix it / breaks other tests (names kept from stage 3) |
+| `NO_PATCH` | no edit at the end (budget or nudges exhausted) |
+| `AGENT_PATCH_APPLY_FAIL` | the patch does not apply on a fresh container |
+| `API_ERROR`, `INFRA_ERROR`, `IMAGE_UNAVAILABLE`, `PREPARE_FAILED` | retried on the next run |
+| `FATAL_API_ERROR` | bad key / no credits: the job stops starting tasks |
+
+Tests: `PYTHONPATH=harness python3 tests/test_generate.py` (real agent loop, scripted model,
+local sandbox), `tests/test_openrouter_wire.py` (real model path, fake server),
+`tests/test_generate_docker.py` (real Docker; first `docker build -t toy/calc:1 tests/toy_image`).
+
+## 5. Next: parse
+
+y\*, L_edit, L_view, search queries and reasoning from `solved.jsonl` + traces, for the
+localizer/fixer plan.
 
 ---
 

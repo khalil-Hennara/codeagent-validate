@@ -104,8 +104,22 @@ def _no_nounset(plan: EvalPlan) -> EvalPlan:
     return plan
 
 
+# pytest-pretty (installed in pydantic images, among others) replaces pytest's `-rA` summary with
+# a table, so no "PASSED tests/x.py::name" lines are printed and the parser sees no results
+# (NO_TEST_OUTPUT). pytest-sugar rewrites the output too. Disabling them changes no test result;
+# `-p no:<name>` is accepted even when the plugin is not installed, and non-pytest runners ignore it.
+PYTEST_PLAIN = 'export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} -p no:pretty -p no:sugar"'
+
+
+def _plain_pytest_output(plan: EvalPlan) -> EvalPlan:
+    lines = plan.script.split("\n")
+    at = 1 if lines and lines[0].startswith("#!") else 0
+    plan.script = "\n".join(lines[:at] + [PYTEST_PLAIN] + lines[at:])
+    return plan
+
+
 def build_plan(task: dict[str, Any]) -> EvalPlan:
-    return _no_nounset(_build_plan(task))
+    return _plain_pytest_output(_no_nounset(_build_plan(task)))
 
 
 def _build_plan(task: dict[str, Any]) -> EvalPlan:
