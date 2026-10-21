@@ -208,7 +208,9 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument("--no-pull", action="store_true")
     gen.add_argument("--rate-limit-wait", type=float, default=90.0)
     gen.add_argument("--model", default="moonshotai/kimi-k3", help="OpenRouter model id")
-    gen.add_argument("--reasoning-effort", choices=["low", "medium", "high"], default=None)
+    gen.add_argument("--reasoning-effort", choices=["low", "medium", "high", "none"], default="high",
+                     help="OpenRouter reasoning effort (default high; 'none' = the model's default)")
+    gen.add_argument("--attempts", type=int, default=2, help="tries per task until solved (new sample each time)")
     gen.add_argument("--extra-body", default="", help='JSON added to each request, e.g. \'{"provider": {"sort": "price"}}\'')
     gen.add_argument("--teacher-dir", default=None, help="agent.yaml + prompts (default: teacher/)")
     gen.add_argument("--time-minutes", type=float, default=45.0, help="agent time budget per task")
@@ -357,7 +359,8 @@ def run_generate(args: argparse.Namespace) -> int:
     targets = _load_targets(args.targets, args.n)
     if n_shards > 1:
         targets = shard_targets(targets, n_shards)
-    cfg = GenConfig(model=args.model, reasoning_effort=args.reasoning_effort,
+    cfg = GenConfig(model=args.model,
+                    reasoning_effort=None if args.reasoning_effort == "none" else args.reasoning_effort,
                     extra_body=json.loads(args.extra_body) if args.extra_body else {},
                     time_minutes=args.time_minutes, tool_calls=args.tool_calls, turns=args.turns,
                     command_timeout=args.command_timeout, mem=args.mem, cpus=args.cpus,
@@ -368,6 +371,9 @@ def run_generate(args: argparse.Namespace) -> int:
     from .generate.rollout import preflight
     cfg.api_base = os.environ.get("OPENROUTER_API_BASE") or None
     print(preflight(cfg), flush=True)
+    print(f"budget per attempt: {cfg.time_minutes} min, {cfg.tool_calls} tool calls, {cfg.turns} turns; "
+          f"up to {args.attempts} attempts per task; reasoning effort {cfg.reasoning_effort or 'model default'}",
+          flush=True)
     print(f"generate: {len(tasks)} candidate tasks, target {targets['solved_target']} solved"
           + (f" (shard {args.shard})" if args.shard else "") + f", model {cfg.model}", flush=True)
 
@@ -379,7 +385,8 @@ def run_generate(args: argparse.Namespace) -> int:
 
     out = Path(args.out)
     run_generation(tasks, targets, cfg, out, runner_factory=factory, workers=args.workers, limit=args.limit,
-                   max_minutes=args.max_minutes, prune_images=args.prune_images, prior=prior)
+                   max_minutes=args.max_minutes, prune_images=args.prune_images, prior=prior,
+                   attempts=args.attempts)
     from .generate.rollout import render_generation_report
     rows = _read_jsonl([str(out / "results.jsonl")]) if (out / "results.jsonl").exists() else []
     (out / "generation_report.md").write_text(render_generation_report(rows, targets), encoding="utf-8")

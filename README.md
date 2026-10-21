@@ -529,7 +529,7 @@ Useful flags: `--only <instance_id>` (one task), `--time-minutes`, `--tool-calls
 | outcome | meaning |
 | --- | --- |
 | `SOLVED` | all FAIL_TO_PASS + PASS_TO_PASS pass with the teacher's patch |
-| `GOLD_FAILS_F2P` / `GOLD_BREAKS_P2P` | the teacher's patch does not fix it / breaks other tests (names kept from stage 3) |
+| `FAILS_F2P` / `BREAKS_P2P` / `MISMATCH_EXPECTED` (R2E) | the teacher's patch does not fix it / breaks other tests; the failing test names follow `failing:` and the test log is in `logs/<id>__a<N>.verify.log` |
 | `NO_PATCH` | no edit at the end (budget or nudges exhausted) |
 | `AGENT_PATCH_APPLY_FAIL` | the patch does not apply on a fresh container |
 | `API_ERROR`, `INFRA_ERROR`, `IMAGE_UNAVAILABLE`, `PREPARE_FAILED` | retried on the next run |

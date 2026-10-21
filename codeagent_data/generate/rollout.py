@@ -79,7 +79,6 @@ def _patched_agent_runner():
 
 def build_eval_config(cfg: GenConfig, out: Path, model_override: Any = None):
     from adk_submission import GenerationConstraints, ModelRegistry
-    from swegemma.budget import EvaluationBudget, HarnessLimits
     from swegemma.config import EvalConfig
 
     models = ModelRegistry()
@@ -102,14 +101,21 @@ def build_eval_config(cfg: GenConfig, out: Path, model_override: Any = None):
         if body:
             kwargs["extra_body"] = body
         models.register("teacher", LiteLlm(model=f"openrouter/{cfg.model}", **kwargs))
-    return EvalConfig(
+    # Budgets go through the flat kwargs, exactly as in the organizers' notebook: the wheel's
+    # EvalConfig ignores `budget=` (the first run got 10 minutes instead of 45).
+    econf = EvalConfig(
         tasks_path=out / "tasks.jsonl", snapshots_dir=out, results_dir=out,
         submission_dir=Path(cfg.teacher_dir), models=models,
-        budget=EvaluationBudget(time_minutes=cfg.time_minutes, tool_calls=cfg.tool_calls, turns=cfg.turns),
-        harness=HarnessLimits(command_timeout_seconds=cfg.command_timeout),
+        timeout_seconds=cfg.command_timeout, max_time_minutes=float(cfg.time_minutes),
+        max_tool_calls=cfg.tool_calls, max_turns=cfg.turns,
         generation_constraints=GenerationConstraints(defaults={}),  # no injected thinking budget
         display_mode="quiet", enable_sandbox_testing=True,
     )
+    got = (econf.budget.time_minutes, econf.budget.tool_calls, econf.budget.turns)
+    if got != (float(cfg.time_minutes), cfg.tool_calls, cfg.turns):
+        raise SystemExit(f"the harness did not take the budget: got {got}, wanted "
+                         f"{(cfg.time_minutes, cfg.tool_calls, cfg.turns)}")
+    return econf
 
 
 def swegemma_task(t: dict[str, Any]):
@@ -162,12 +168,12 @@ def trace_stats(trace: Any) -> dict[str, int]:
     return dict(st)
 
 
-def save_trace(trace: Any, out: Path, instance_id: str) -> str | None:
+def save_trace(trace: Any, out: Path, instance_id: str, attempt: int = 1) -> str | None:
     """Raw entry list ("legacy" format): keeps thinking / text / tool_call / tool_response / usage
     apart, which the SFT parser needs (the ATIF export merges thinking into the message text)."""
     if trace is None:
         return None
-    path = out / "traces" / f"{instance_id.replace('/', '__')}.json"
+    path = out / "traces" / f"{instance_id.replace('/', '__')}__a{attempt}.json"
     trace.save(path, format="legacy")
     return str(path.relative_to(out))  # relative to the run folder, so shard artifacts can move
 
@@ -244,10 +250,13 @@ class Attempt:
     stats: dict[str, int] = field(default_factory=dict)
     trace_path: str | None = None
     model: str = ""
+    attempt: int = 1
 
 
-def verify_patch(task: dict[str, Any], patch: str, runner: Any, timeout_s: int = 1800) -> tuple[bool, str]:
-    """Run the task's tests on base + (setup) + teacher patch in a fresh container."""
+def verify_patch(task: dict[str, Any], patch: str, runner: Any, timeout_s: int = 1800,
+                 log_path: Path | None = None) -> tuple[bool, str]:
+    """Run the task's tests on base + (setup) + teacher patch in a fresh container. The test log
+    of an unsolved attempt is kept at `log_path`, with the failing F2P/P2P names, for review."""
     try:
         plan = build_plan(task)
     except UnsupportedVerifier as e:
@@ -256,21 +265,31 @@ def verify_patch(task: dict[str, Any], patch: str, runner: Any, timeout_s: int =
     res = runner.run(task["env_image"], plan.script, workdir=plan.workdir,
                      patches=setup + [("agent", patch)], timeout_s=timeout_s)
     if res.stage == "agent_apply":
-        return False, "AGENT_PATCH_APPLY_FAIL"
-    if res.stage == "timeout":
-        return False, "TIMEOUT (verification)"
-    if res.stage != "done":
-        return False, f"INFRA_ERROR: verification stopped at {res.stage}"
-    v = judge(task, plan, "", [res.log])
-    return v.valid, ("SOLVED" if v.valid else v.reason)
+        ok, reason = False, "AGENT_PATCH_APPLY_FAIL"
+    elif res.stage == "timeout":
+        ok, reason = False, "TIMEOUT (verification)"
+    elif res.stage != "done":
+        ok, reason = False, f"INFRA_ERROR: verification stopped at {res.stage}"
+    else:
+        v = judge(task, plan, "", [res.log])
+        # stage 3's verdict names talk about "the gold patch"; here it is the teacher's patch
+        ok, reason = v.valid, ("SOLVED" if v.valid else v.reason.replace("GOLD_", "", 1)
+                               .replace("the gold patch", "the teacher's patch"))
+        if not ok:
+            failing = (v.f2p_fail_on_gold or []) + (v.p2p_fail_on_gold or [])
+            reason += "" if not failing else f" | failing: {', '.join(failing[:8])}"
+    if not ok and log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(f"{reason}\n\n{res.log}", encoding="utf-8", errors="replace")
+    return ok, reason
 
 
-def run_one(task: dict[str, Any], cfg: GenConfig, out: Path, runner: Any, *,
+def run_one(task: dict[str, Any], cfg: GenConfig, out: Path, runner: Any, *, attempt: int = 1,
             sandbox_factory: Callable[[dict[str, Any]], Any] | None = None,
             model_override: Any = None) -> Attempt:
     t0 = time.time()
     a = Attempt(task["instance_id"], task.get("uid", ""), task.get("verifier", ""), task.get("repo", ""),
-                task.get("fold", ""), int(task.get("selection_rank", -1)), model=cfg.model)
+                task.get("fold", ""), int(task.get("selection_rank", -1)), model=cfg.model, attempt=attempt)
     if sandbox_factory is None:
         err = runner.ensure_image(task["env_image"])
         if err:
@@ -291,14 +310,15 @@ def run_one(task: dict[str, Any], cfg: GenConfig, out: Path, runner: Any, *,
     a.agent_error, a.patch = agent_error, patch or ""
     a.stats = trace_stats(trace)
     a.est_cost_usd = round(estimate_cost(a.stats, cfg), 4)
-    a.trace_path = save_trace(trace, out, task["instance_id"])
+    a.trace_path = save_trace(trace, out, task["instance_id"], attempt)
     kind = classify_agent_error(agent_error)
     if kind:
         a.reason = f"{kind}: {agent_error[:300]}"
     elif not a.patch.strip():
         a.reason = "NO_PATCH" + (f": {agent_error[:200]}" if agent_error else "")
     else:
-        a.solved, a.reason = verify_patch(task, a.patch, runner)
+        log = out / "logs" / f"{task['instance_id'].replace('/', '__')}__a{attempt}.verify.log"
+        a.solved, a.reason = verify_patch(task, a.patch, runner, log_path=log)
     a.seconds = time.time() - t0
     return a
 
@@ -328,33 +348,44 @@ def select_shard_tasks(tasks: list[dict[str, Any]], shard: str | None) -> tuple[
 def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: GenConfig, out: Path, *,
                    runner_factory: Callable[[], Any], workers: int = 4, limit: int = 0,
                    max_minutes: float | None = None, prune_images: bool = False,
-                   prior: list[dict[str, Any]] | None = None,
+                   attempts: int = 1, prior: list[dict[str, Any]] | None = None,
                    sandbox_factory: Callable[[dict[str, Any]], Any] | None = None,
                    model_override: Any = None) -> list[Attempt]:
     """`prior`: results of earlier runs (e.g. results_merged.jsonl). Those of these `tasks` that
-    finished are skipped and their solved ones count toward the target."""
+    finished are skipped and their solved ones count toward the target.
+
+    `attempts`: an unsolved task is tried again (a new sample; temperature 1.0) up to this many
+    times in total. Retries go to the end of the queue, so new tasks come first."""
     from ..select import should_attempt
 
     out.mkdir(parents=True, exist_ok=True)
     results_fp = out / "results.jsonl"
     mine = {t["instance_id"] for t in tasks}
-    done: dict[str, dict[str, Any]] = {}
     earlier = [r for r in prior or [] if r["instance_id"] in mine]
     if results_fp.exists():  # resumable: keep finished attempts, retry infrastructure failures
         earlier += list(iter_jsonl(results_fp))
+    finals: dict[str, set[int]] = {}
+    solved_ids: dict[str, dict[str, Any]] = {}
     for r in earlier:
         if is_final(r):
-            done[r["instance_id"]] = r
-    solved_src = Counter(r["verifier"] for r in done.values() if r.get("solved"))
-    solved_repo = Counter((r.get("repo") or "").lower() for r in done.values() if r.get("solved"))
-    queue = [t for t in tasks if t["instance_id"] not in done]
+            finals.setdefault(r["instance_id"], set()).add(int(r.get("attempt") or 1))
+            if r.get("solved"):
+                solved_ids.setdefault(r["instance_id"], r)
+    solved_src = Counter(r["verifier"] for r in solved_ids.values())
+    solved_repo = Counter((r.get("repo") or "").lower() for r in solved_ids.values())
+
+    def next_attempt(iid: str) -> int:
+        return max(finals.get(iid, {0})) + 1
+
+    queue = [(t, next_attempt(t["instance_id"])) for t in tasks
+             if t["instance_id"] not in solved_ids and next_attempt(t["instance_id"]) <= attempts]
     runner = runner_factory()
     lock = threading.Lock()
     state = {"next": 0, "started": 0, "stop": None, "api_fail_streak": 0}
     t0 = time.time()
     results: list[Attempt] = []
 
-    def next_task() -> dict[str, Any] | None:
+    def next_task() -> tuple[dict[str, Any], int] | None:
         with lock:
             while True:
                 if state["stop"]:
@@ -371,28 +402,32 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
                 if state["next"] >= len(queue):
                     state["stop"] = "no tasks left"
                     return None
-                t = queue[state["next"]]
+                t, k = queue[state["next"]]
                 state["next"] += 1
                 if should_attempt(t, solved_src, solved_repo, targets):
                     state["started"] += 1
-                    return t
+                    return t, k
 
     def worker() -> None:
         while True:
-            t = next_task()
-            if t is None:
+            nxt = next_task()
+            if nxt is None:
                 return
+            t, k = nxt
             try:
-                a = run_one(t, cfg, out, runner, sandbox_factory=sandbox_factory, model_override=model_override)
+                a = run_one(t, cfg, out, runner, attempt=k, sandbox_factory=sandbox_factory,
+                            model_override=model_override)
             except Exception as e:  # noqa: BLE001
                 a = Attempt(t["instance_id"], t.get("uid", ""), t.get("verifier", ""), t.get("repo", ""),
-                            reason=f"INFRA_ERROR: {str(e)[:300]}")
+                            reason=f"INFRA_ERROR: {str(e)[:300]}", attempt=k)
             if prune_images and t.get("env_image") and sandbox_factory is None:
                 runner.remove_image(t["env_image"])
             with lock:
                 if a.solved:
                     solved_src[a.verifier] += 1
                     solved_repo[a.repo.lower()] += 1
+                elif is_final(asdict(a)) and k < attempts:
+                    queue.append((t, k + 1))  # another sample later
                 if a.reason.startswith("FATAL_API_ERROR"):
                     state["stop"] = f"fatal API error, stopping: {a.reason[:200]}"
                 # the model never answering (bad setup, provider down) is not the tasks' fault:
@@ -408,7 +443,7 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
                 results.append(a)
                 n_solved = sum(solved_src.values())
                 el = (time.time() - t0) / 60
-                print(f"[{el:.0f} min] {a.instance_id}: {a.reason[:120]}  "
+                print(f"[{el:.0f} min] {a.instance_id} (try {k}): {a.reason[:120]}  "
                       f"(solved {n_solved}/{targets['solved_target']}, ~${a.est_cost_usd:.2f})", flush=True)
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, workers))]
@@ -446,8 +481,14 @@ def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any]
         ctx.append(st.get("max_context_tokens", 0))
         secs += float(r.get("seconds") or 0)
     n, solved = len(final), sum(bool(r.get("solved")) for r in final)
+    task_ids = {r["instance_id"] for r in final}
+    solved_tasks = {r["instance_id"] for r in final if r.get("solved")}
+    first = [r for r in final if int(r.get("attempt") or 1) == 1]
     lines = ["# Generation report", "", f"attempts: {n}  solved: {solved}"
-             + (f"  ({solved / n:.0%})" if n else ""), ""]
+             + (f"  ({solved / n:.0%})" if n else ""),
+             f"tasks: {len(task_ids)}  solved: {len(solved_tasks)}"
+             + (f"  ({len(solved_tasks) / len(task_ids):.0%}; first try "
+                f"{sum(bool(r.get('solved')) for r in first) / max(1, len(first)):.0%})" if task_ids else ""), ""]
     lines += ["| source | attempted | solved | rate |", "| --- | --- | --- | --- |"]
     for s, c in sorted(by_src.items()):
         lines.append(f"| {s} | {c['attempted']} | {c['solved']} | {c['solved'] / max(1, c['attempted']):.0%} |")
@@ -487,25 +528,30 @@ def merge_generation(tasks: list[dict[str, Any]], result_files: list[Path], targ
 
     from ..select import should_attempt
 
-    rows: dict[str, dict[str, Any]] = {}
-    trace_src: dict[str, Path] = {}
+    rows: dict[tuple[str, int], dict[str, Any]] = {}
+    trace_src: dict[tuple[str, int], Path] = {}
     for fp in result_files:
         if not fp.exists():
             continue
         for r in iter_jsonl(fp):
-            old = rows.get(r["instance_id"])
+            key = (r["instance_id"], int(r.get("attempt") or 1))
+            old = rows.get(key)
             if old is not None and is_final(old) and not is_final(r):
                 continue  # never replace a finished attempt by a later infrastructure failure
-            rows[r["instance_id"]] = r
+            rows[key] = r
             if r.get("trace_path") and (fp.parent / r["trace_path"]).exists():
-                trace_src[r["instance_id"]] = fp.parent / r["trace_path"]
+                trace_src[key] = fp.parent / r["trace_path"]
     out.mkdir(parents=True, exist_ok=True)
     with (out / "results_merged.jsonl").open("w", encoding="utf-8") as f:
         for r in rows.values():
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     by_id = {t["instance_id"]: t for t in tasks}
-    solved = sorted((r for r in rows.values() if r.get("solved") and r["instance_id"] in by_id),
-                    key=lambda r: int(by_id[r["instance_id"]].get("selection_rank", 1 << 30)))
+    first_solved: dict[str, dict[str, Any]] = {}
+    for key in sorted(rows, key=lambda k: k[1]):
+        r = rows[key]
+        if r.get("solved") and r["instance_id"] in by_id:
+            first_solved.setdefault(r["instance_id"], r)
+    solved = sorted(first_solved.values(), key=lambda r: int(by_id[r["instance_id"]].get("selection_rank", 1 << 30)))
     src_c: Counter[str] = Counter()
     repo_c: Counter[str] = Counter()
     accepted = 0
@@ -519,10 +565,12 @@ def merge_generation(tasks: list[dict[str, Any]], result_files: list[Path], targ
             repo_c[(t.get("repo") or "").lower()] += 1
             accepted += 1
             trace = None
-            if r["instance_id"] in trace_src:
-                trace = f"traces/{trace_src[r['instance_id']].name}"
-                shutil.copy2(trace_src[r["instance_id"]], out / trace)
-            teacher = {k: r.get(k) for k in ("model", "patch", "stats", "est_cost_usd", "seconds", "agent_error")}
+            key = (r["instance_id"], int(r.get("attempt") or 1))
+            if key in trace_src:
+                trace = f"traces/{trace_src[key].name}"
+                shutil.copy2(trace_src[key], out / trace)
+            teacher = {k: r.get(k) for k in ("model", "patch", "stats", "est_cost_usd", "seconds", "agent_error",
+                                             "attempt")}
             f.write(json.dumps({**t, "teacher": {**teacher, "trace": trace}}, ensure_ascii=False) + "\n")
     report = render_generation_report(list(rows.values()), targets)
     report += f"\naccepted under the global limits (solved.jsonl): {accepted} of {targets['solved_target']}\n"

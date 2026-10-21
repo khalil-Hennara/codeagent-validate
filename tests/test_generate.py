@@ -152,7 +152,7 @@ def test_wrong_fix_not_solved():
     bad[1] = ("edit_file", {"filepath": "calc.py", "old_string": "return a - b", "new_string": "return a * b"})
     a = rollout.run_one(TASK, cfg(), Path(tempfile.mkdtemp()), ApplyAndPytestRunner(),
                         sandbox_factory=toy_sandbox_factory, model_override=ScriptedLlm(script=bad))
-    assert not a.solved and a.reason.startswith("GOLD_FAILS_F2P"), a.reason
+    assert not a.solved and a.reason.startswith("FAILS_F2P"), a.reason
     print("ok test_wrong_fix_not_solved", a.reason[:60])
 
 
@@ -200,10 +200,48 @@ def test_run_generation_target_limit_and_resume():
     print("ok test_run_generation_target_limit_and_resume")
 
 
+def test_second_attempt_and_verify_log():
+    """attempts=2: a wrong first try is re-queued after the new tasks and the second try solves it;
+    the failing try keeps its verification log and both traces are kept."""
+    tries: dict = {}
+
+    class FlakyLlm(ScriptedLlm):
+        async def generate_content_async(self, llm_request, stream=False):
+            seen = sum(1 for c in llm_request.contents for p in (c.parts or []) if p.function_response)
+            iid = "x"
+            if seen == 0:
+                tries[iid] = tries.get(iid, 0) + 1
+            bad = list(FIX_SCRIPT)
+            bad[1] = ("edit_file", {"filepath": "calc.py", "old_string": "return a - b", "new_string": "return a * b"})
+            self.script = bad if tries[iid] == 1 else FIX_SCRIPT
+            async for r in super().generate_content_async(llm_request, stream):
+                yield r
+
+    out = Path(tempfile.mkdtemp())
+    targets = {"solved_target": 5, "max_per_repo": 100, "max_share": {}}
+    res = rollout.run_generation([TASK], targets, cfg(), out, runner_factory=ApplyAndPytestRunner, workers=1,
+                                 attempts=2, sandbox_factory=toy_sandbox_factory, model_override=FlakyLlm())
+    assert [(r.attempt, r.solved) for r in res] == [(1, False), (2, True)], [(r.attempt, r.reason) for r in res]
+    assert "failing: tests/test_calc.py::test_add" in res[0].reason, res[0].reason
+    assert (out / "logs" / "toy__calc-1__a1.verify.log").exists()
+    assert (out / res[0].trace_path).exists() and (out / res[1].trace_path).exists()
+    # resume: nothing left; merge picks the solved try
+    assert rollout.run_generation([TASK], targets, cfg(), out, runner_factory=ApplyAndPytestRunner,
+                                  attempts=2, sandbox_factory=toy_sandbox_factory, model_override=FlakyLlm()) == []
+    merged = Path(tempfile.mkdtemp())
+    st = rollout.merge_generation([TASK], [out / "results.jsonl"], targets, merged)
+    assert st == {"rows": 2, "solved": 1, "accepted": 1}, st
+    row = json.loads((merged / "solved.jsonl").read_text())
+    assert row["teacher"]["attempt"] == 2 and row["teacher"]["trace"].endswith("__a2.json")
+    rep = (merged / "generation_report.md").read_text()
+    assert "tasks: 1  solved: 1  (100%; first try 0%)" in rep, rep
+    print("ok test_second_attempt_and_verify_log")
+
+
 def test_stops_when_the_api_keeps_failing():
     calls = []
 
-    def failing_run_one(task, *a, **k):
+    def failing_run_one(task, *a, attempt=1, **k):
         calls.append(task["instance_id"])
         return rollout.Attempt(task["instance_id"], verifier="swe_gym", repo="toy/calc",
                                reason="API_ERROR: Sandbox execution error: litellm.APIConnectionError: boom",
@@ -265,6 +303,7 @@ def test_prepare_script_in_container_layout():
 if __name__ == "__main__":
     test_classify_and_shards()
     test_stops_when_the_api_keeps_failing()
+    test_second_attempt_and_verify_log()
     test_prepare_script_in_container_layout()
     test_solves_and_records()
     test_wrong_fix_not_solved()
