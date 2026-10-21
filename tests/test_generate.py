@@ -41,6 +41,7 @@ TASK = {
     "test_patch": TEST_PATCH, "env_image": "toy:latest", "env_workdir": "/testbed",
     "FAIL_TO_PASS": ["tests/test_calc.py::test_add"], "PASS_TO_PASS": [],
     "selection_rank": 0, "fold": "A", "version": "",
+    "patch": "--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b\n",
 }
 
 
@@ -238,6 +239,33 @@ def test_second_attempt_and_verify_log():
     print("ok test_second_attempt_and_verify_log")
 
 
+def test_retry_only_when_promising_and_flaky_rerun():
+    # wrong area (edits another file, no F2P passes): not worth a second try
+    wrong_area = [("write_file", {"filepath": "other.py", "content": "x = 1\n"}), ("submit_patch", {}), ("final", {})]
+    out = Path(tempfile.mkdtemp())
+    res = rollout.run_generation([TASK], {"solved_target": 5, "max_per_repo": 100, "max_share": {}}, cfg(), out,
+                                 runner_factory=ApplyAndPytestRunner, workers=1, attempts=3,
+                                 sandbox_factory=toy_sandbox_factory, model_override=ScriptedLlm(script=wrong_area))
+    assert len(res) == 1 and not res[0].solved, [r.reason for r in res]
+    assert res[0].loc == {"gold_files": ["calc.py"], "teacher_files": ["other.py"], "hit": 0, "all_gold_files": False}
+    assert res[0].tests["f2p_pass_frac"] == 0 and res[0].gold == {"files": 1, "lines": 2, "hunks": 1}
+    assert not rollout.retry_worthy(res[0])
+
+    # a test that fails once and passes on the re-run: accepted, marked flaky
+    class FlakyRunner(ApplyAndPytestRunner):
+        def run(self, image, script, *, workdir, patches=None, timeout_s=1800):
+            r = super().run(image, script, workdir=workdir, patches=patches, timeout_s=timeout_s)
+            if len(self.calls) == 1:
+                r.log = r.log.replace("PASSED tests/test_calc.py", "FAILED tests/test_calc.py")
+            return r
+    runner = FlakyRunner()
+    ok, reason, _ = rollout.verify_patch(TASK, TASK["patch"], runner)
+    assert ok and "flaky" in reason and len(runner.calls) == 2, reason
+    rep = rollout.render_generation_report([{**rollout.asdict(res[0])}])
+    assert "editing at least one file of the reference fix: 0" in rep and "| 1-10 | 1 | 0 | 0% |" in rep, rep
+    print("ok test_retry_only_when_promising_and_flaky_rerun")
+
+
 def test_stops_when_the_api_keeps_failing():
     calls = []
 
@@ -304,6 +332,7 @@ if __name__ == "__main__":
     test_classify_and_shards()
     test_stops_when_the_api_keeps_failing()
     test_second_attempt_and_verify_log()
+    test_retry_only_when_promising_and_flaky_rerun()
     test_prepare_script_in_container_layout()
     test_solves_and_records()
     test_wrong_fix_not_solved()

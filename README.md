@@ -535,6 +535,16 @@ Useful flags: `--only <instance_id>` (one task), `--time-minutes`, `--tool-calls
 | `API_ERROR`, `INFRA_ERROR`, `IMAGE_UNAVAILABLE`, `PREPARE_FAILED` | retried on the next run |
 | `FATAL_API_ERROR` | bad key / no credits: the job stops starting tasks |
 
+How close an unsolved try came is recorded per attempt: `tests` (target tests still failing, share
+of FAIL_TO_PASS passing) and `loc` (which files of the reference fix the teacher's patch edits).
+When only 1-2 target tests fail, the tests are run once more before rejecting (stage 3 ran the
+gold patch once, so a flaky test could reject a correct patch). A second try (`ATTEMPTS`) is only
+spent on tasks where the first got somewhere: half or more of F2P passing, a file of the reference
+fix edited, or no patch before the budget ran out. Only SOLVED trajectories go to `solved.jsonl`;
+near-misses that edited the right files stay in `results_merged.jsonl` for localization-only use.
+The report shows the solve rate by size of the reference fix; `MAX_GOLD_LINES` /
+`MAX_GOLD_FILES` in the workflow (or `--max-gold-lines/--max-gold-files`) skip larger tasks.
+
 Before any container starts, `generate` sends one small request through exactly the agent's
 model path (`preflight OK ... reasoning returned: yes` in the log); a wrong key, model id or a
 missing dependency stops the job there. If the API still fails 3 times in a row during the run

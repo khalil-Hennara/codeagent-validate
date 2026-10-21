@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..jsonl import iter_jsonl
+from ..patches import is_protected_config, is_test_path, parse_patch
 from ..validate.specs import UnsupportedVerifier, build_plan
 from ..validate.validator import judge
 from .prepare import SETUP_PATCH_PATH, prepare_script
@@ -123,7 +124,7 @@ def swegemma_task(t: dict[str, Any]):
 
     return Task(instance_id=t["instance_id"], repo=t["repo"], base_commit=t.get("base_commit") or "",
                 problem_statement=t["problem_statement"], patch="", test_patch=t.get("test_patch") or "",
-                hints_text="")
+                hints_text="")  # never: the student does not see hints, so neither does the teacher
 
 
 def make_image_sandbox(task: dict[str, Any], cfg: GenConfig, put_file: Callable[..., None]):
@@ -251,37 +252,100 @@ class Attempt:
     trace_path: str | None = None
     model: str = ""
     attempt: int = 1
+    # how close an unsolved patch came: target tests failing, F2P passing fraction
+    tests: dict[str, Any] = field(default_factory=dict)
+    # localization: the gold patch's source files that the teacher's patch also edits
+    loc: dict[str, Any] = field(default_factory=dict)
+    gold: dict[str, int] = field(default_factory=dict)  # size of the reference fix
+
+
+def source_files(patch: str) -> list[str]:
+    return sorted({f.path for f in parse_patch(patch or "").files
+                   if f.path and not is_test_path(f.path) and not is_protected_config(f.path)})
+
+
+def gold_size(task: dict[str, Any]) -> dict[str, int]:
+    """Size of the reference fix (source files only): the best cheap predictor of difficulty."""
+    files = [f for f in parse_patch(task.get("patch") or "").files
+             if f.path and not is_test_path(f.path) and not is_protected_config(f.path)]
+    return {"files": len(files), "lines": sum(f.added + f.removed for f in files),
+            "hunks": sum(f.hunks for f in files)}
+
+
+def size_bucket(lines: int) -> str:
+    return "1-10" if lines <= 10 else "11-30" if lines <= 30 else "31-80" if lines <= 80 else ">80"
+
+
+def localization(task: dict[str, Any], patch: str) -> dict[str, Any]:
+    gold, mine = source_files(task.get("patch") or ""), source_files(patch)
+    hit = sorted(set(gold) & set(mine))
+    return {"gold_files": gold, "teacher_files": mine, "hit": len(hit),
+            "all_gold_files": bool(gold) and len(hit) == len(gold)}
+
+
+def _test_progress(task: dict[str, Any], v: Any) -> dict[str, Any]:
+    f2p = set(task.get("FAIL_TO_PASS") or [])
+    failing = set(v.f2p_fail_on_gold or []) | set(v.p2p_fail_on_gold or [])
+    f2p_failing = len(failing & f2p) if f2p else len(v.f2p_fail_on_gold or [])
+    n_f2p = len(f2p) or max(1, v.f2p_total)
+    return {"failing": len(failing), "f2p_failing": f2p_failing, "f2p_total": n_f2p,
+            "f2p_pass_frac": round(1 - f2p_failing / n_f2p, 3), "failing_names": sorted(failing)[:20]}
 
 
 def verify_patch(task: dict[str, Any], patch: str, runner: Any, timeout_s: int = 1800,
-                 log_path: Path | None = None) -> tuple[bool, str]:
-    """Run the task's tests on base + (setup) + teacher patch in a fresh container. The test log
-    of an unsolved attempt is kept at `log_path`, with the failing F2P/P2P names, for review."""
+                 log_path: Path | None = None, flaky_rerun_max: int = 2) -> tuple[bool, str, dict[str, Any]]:
+    """Run the task's tests on base + (setup) + teacher patch in a fresh container.
+
+    When only 1-2 target tests fail, the tests are run once more: stage 3 ran the gold patch only
+    once, so a flaky test could otherwise reject a correct patch. The test log of an unsolved
+    attempt is kept at `log_path` for review. Returns (solved, reason, test progress)."""
     try:
         plan = build_plan(task)
     except UnsupportedVerifier as e:
-        return False, f"UNSUPPORTED: {e}"
+        return False, f"UNSUPPORTED: {e}", {}
     setup = [("setup", task["setup_patch"])] if (task.get("setup_patch") or "").strip() else []
-    res = runner.run(task["env_image"], plan.script, workdir=plan.workdir,
-                     patches=setup + [("agent", patch)], timeout_s=timeout_s)
-    if res.stage == "agent_apply":
-        ok, reason = False, "AGENT_PATCH_APPLY_FAIL"
-    elif res.stage == "timeout":
-        ok, reason = False, "TIMEOUT (verification)"
-    elif res.stage != "done":
-        ok, reason = False, f"INFRA_ERROR: verification stopped at {res.stage}"
-    else:
-        v = judge(task, plan, "", [res.log])
-        # stage 3's verdict names talk about "the gold patch"; here it is the teacher's patch
-        ok, reason = v.valid, ("SOLVED" if v.valid else v.reason.replace("GOLD_", "", 1)
-                               .replace("the gold patch", "the teacher's patch"))
-        if not ok:
-            failing = (v.f2p_fail_on_gold or []) + (v.p2p_fail_on_gold or [])
-            reason += "" if not failing else f" | failing: {', '.join(failing[:8])}"
+    progress: dict[str, Any] = {}
+    logs: list[str] = []
+    for run in range(2):
+        res = runner.run(task["env_image"], plan.script, workdir=plan.workdir,
+                         patches=setup + [("agent", patch)], timeout_s=timeout_s)
+        logs.append(res.log)
+        if res.stage == "agent_apply":
+            ok, reason = False, "AGENT_PATCH_APPLY_FAIL"
+        elif res.stage == "timeout":
+            ok, reason = False, "TIMEOUT (verification)"
+        elif res.stage != "done":
+            ok, reason = False, f"INFRA_ERROR: verification stopped at {res.stage}"
+        else:
+            v = judge(task, plan, "", [res.log])
+            # stage 3's verdict names talk about "the gold patch"; here it is the teacher's patch
+            ok = v.valid
+            reason = "SOLVED" if ok else (v.reason.replace("GOLD_", "", 1)
+                                          .replace("the gold patch", "the teacher's patch"))
+            if ok and run == 1:
+                reason = "SOLVED (on a re-run: a target test is flaky)"
+            if not ok:
+                progress = _test_progress(task, v)
+                if progress["failing_names"]:
+                    reason += f" | failing: {', '.join(progress['failing_names'][:8])}"
+            if not ok and run == 0 and 0 < progress.get("failing", 0) <= flaky_rerun_max:
+                continue  # one more run before rejecting a near-miss
+        break
     if not ok and log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(f"{reason}\n\n{res.log}", encoding="utf-8", errors="replace")
-    return ok, reason
+        log_path.write_text(f"{reason}\n\n" + "\n\n>>>>> RE-RUN\n\n".join(logs), encoding="utf-8",
+                            errors="replace")
+    return ok, reason, progress
+
+
+def retry_worthy(a: "Attempt") -> bool:
+    """Spend a second try only where the first one got somewhere: half or more of the F2P tests
+    pass, or the patch edits the right files, or the budget ran out before a patch existed."""
+    if a.solved:
+        return False
+    if a.reason.startswith("NO_PATCH"):
+        return True
+    return (a.tests.get("f2p_pass_frac", 0) >= 0.5) or bool(a.loc.get("hit"))
 
 
 def run_one(task: dict[str, Any], cfg: GenConfig, out: Path, runner: Any, *, attempt: int = 1,
@@ -289,7 +353,8 @@ def run_one(task: dict[str, Any], cfg: GenConfig, out: Path, runner: Any, *, att
             model_override: Any = None) -> Attempt:
     t0 = time.time()
     a = Attempt(task["instance_id"], task.get("uid", ""), task.get("verifier", ""), task.get("repo", ""),
-                task.get("fold", ""), int(task.get("selection_rank", -1)), model=cfg.model, attempt=attempt)
+                task.get("fold", ""), int(task.get("selection_rank", -1)), model=cfg.model, attempt=attempt,
+                gold=gold_size(task))
     if sandbox_factory is None:
         err = runner.ensure_image(task["env_image"])
         if err:
@@ -318,7 +383,8 @@ def run_one(task: dict[str, Any], cfg: GenConfig, out: Path, runner: Any, *, att
         a.reason = "NO_PATCH" + (f": {agent_error[:200]}" if agent_error else "")
     else:
         log = out / "logs" / f"{task['instance_id'].replace('/', '__')}__a{attempt}.verify.log"
-        a.solved, a.reason = verify_patch(task, a.patch, runner, log_path=log)
+        a.loc = localization(task, a.patch)
+        a.solved, a.reason, a.tests = verify_patch(task, a.patch, runner, log_path=log)
     a.seconds = time.time() - t0
     return a
 
@@ -426,7 +492,7 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
                 if a.solved:
                     solved_src[a.verifier] += 1
                     solved_repo[a.repo.lower()] += 1
-                elif is_final(asdict(a)) and k < attempts:
+                elif is_final(asdict(a)) and k < attempts and retry_worthy(a):
                     queue.append((t, k + 1))  # another sample later
                 if a.reason.startswith("FATAL_API_ERROR"):
                     state["stop"] = f"fatal API error, stopping: {a.reason[:200]}"
@@ -493,6 +559,24 @@ def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any]
     for s, c in sorted(by_src.items()):
         lines.append(f"| {s} | {c['attempted']} | {c['solved']} | {c['solved'] / max(1, c['attempted']):.0%} |")
     lines += ["", "## Outcomes", ""] + [f"- {k}: {v}" for k, v in reasons.most_common()]
+    unsolved = [r for r in final if not r.get("solved") and r.get("patch")]
+    if unsolved:
+        near = sum((r.get("tests") or {}).get("f2p_pass_frac", 0) >= 0.5 for r in unsolved)
+        right = sum(bool((r.get("loc") or {}).get("hit")) for r in unsolved)
+        lines += ["", f"unsolved with a patch: {len(unsolved)}; half or more of F2P passing: {near}; "
+                      f"editing at least one file of the reference fix: {right}"]
+    by_size: dict[str, Counter] = {}
+    for r in final:
+        if r.get("gold"):
+            c = by_size.setdefault(size_bucket(r["gold"].get("lines", 0)), Counter())
+            c["n"] += 1
+            c["solved"] += bool(r.get("solved"))
+    if by_size:
+        order = ["1-10", "11-30", "31-80", ">80"]
+        lines += ["", "## Solve rate by size of the reference fix (changed source lines)", "",
+                  "| lines | attempts | solved | rate |", "| --- | --- | --- | --- |"]
+        lines += [f"| {k} | {by_size[k]['n']} | {by_size[k]['solved']} | {by_size[k]['solved'] / by_size[k]['n']:.0%} |"
+                  for k in order if k in by_size]
     if n:
         lines += ["", "## Cost and time (per attempt)", "",
                   f"- prompt tokens: {tokens_in / n:,.0f} (cached {cached / max(1, tokens_in):.0%})   "

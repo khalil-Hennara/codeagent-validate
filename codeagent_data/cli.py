@@ -210,6 +210,10 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument("--model", default="moonshotai/kimi-k3", help="OpenRouter model id")
     gen.add_argument("--reasoning-effort", choices=["low", "medium", "high", "none"], default="high",
                      help="OpenRouter reasoning effort (default high; 'none' = the model's default)")
+    gen.add_argument("--max-gold-lines", type=int, default=0,
+                     help="skip tasks whose reference fix changes more source lines (0 = no limit)")
+    gen.add_argument("--max-gold-files", type=int, default=0,
+                     help="skip tasks whose reference fix touches more source files (0 = no limit)")
     gen.add_argument("--attempts", type=int, default=2, help="tries per task until solved (new sample each time)")
     gen.add_argument("--extra-body", default="", help='JSON added to each request, e.g. \'{"provider": {"sort": "price"}}\'')
     gen.add_argument("--teacher-dir", default=None, help="agent.yaml + prompts (default: teacher/)")
@@ -356,6 +360,13 @@ def run_generate(args: argparse.Namespace) -> int:
     tasks, n_shards = select_shard_tasks(_read_jsonl(args.tasks), args.shard)
     if args.only:
         tasks = [t for t in tasks if t["instance_id"] in set(args.only)]
+    if args.max_gold_lines or args.max_gold_files:
+        from .generate.rollout import gold_size
+        before = len(tasks)
+        tasks = [t for t in tasks
+                 if (not args.max_gold_lines or gold_size(t)["lines"] <= args.max_gold_lines)
+                 and (not args.max_gold_files or gold_size(t)["files"] <= args.max_gold_files)]
+        print(f"difficulty filter: kept {len(tasks)} of {before} tasks", flush=True)
     targets = _load_targets(args.targets, args.n)
     if n_shards > 1:
         targets = shard_targets(targets, n_shards)
