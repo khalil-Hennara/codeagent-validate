@@ -535,6 +535,11 @@ Useful flags: `--only <instance_id>` (one task), `--time-minutes`, `--tool-calls
 | `API_ERROR`, `INFRA_ERROR`, `IMAGE_UNAVAILABLE`, `PREPARE_FAILED` | retried on the next run |
 | `FATAL_API_ERROR` | bad key / no credits: the job stops starting tasks |
 
+Before any container starts, `generate` sends one small request through exactly the agent's
+model path (`preflight OK ... reasoning returned: yes` in the log); a wrong key, model id or a
+missing dependency stops the job there. If the API still fails 3 times in a row during the run
+(more with more workers), the job stops instead of running through the queue.
+
 Tests: `PYTHONPATH=harness python3 tests/test_generate.py` (real agent loop, scripted model,
 local sandbox), `tests/test_openrouter_wire.py` (real model path, fake server),
 `tests/test_generate_docker.py` (real Docker; first `docker build -t toy/calc:1 tests/toy_image`).

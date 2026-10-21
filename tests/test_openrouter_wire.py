@@ -61,6 +61,9 @@ def main():
     cfg = rollout.GenConfig(time_minutes=5, tool_calls=20, turns=30, api_base=f"http://127.0.0.1:{srv.server_port}",
                             reasoning_effort="high", extra_body={"provider": {"sort": "price"}},
                             price_in=0.6, price_out=2.5, price_cached=0.15)
+    msg = rollout.preflight(cfg)
+    assert msg.startswith("preflight OK") and "reasoning returned: yes" in msg, msg
+    REQUESTS.clear()
     out = Path(tempfile.mkdtemp())
     a = rollout.run_one(TASK, cfg, out, ApplyAndPytestRunner(), sandbox_factory=toy_sandbox_factory)
     srv.shutdown()

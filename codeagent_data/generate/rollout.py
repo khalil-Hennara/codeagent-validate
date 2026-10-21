@@ -179,6 +179,38 @@ def estimate_cost(st: dict[str, int], cfg: GenConfig) -> float:
     return (uncached * cfg.price_in + cached * price_cached + st.get("completion_tokens", 0) * cfg.price_out) / 1e6
 
 
+def preflight(cfg: GenConfig, model_override: Any = None) -> str:
+    """One small request through exactly the agent's path (ADK LiteLlm -> litellm -> OpenRouter, with
+    a tool declared) before any container starts: a wrong key, model id or missing dependency fails
+    here in seconds instead of after every task's setup."""
+    from google.adk.models.llm_request import LlmRequest
+    from google.genai import types
+
+    model = model_override or build_eval_config(cfg, Path("/tmp")).models.get("teacher")
+    tool = types.Tool(function_declarations=[types.FunctionDeclaration(
+        name="get_status", description="Return the session status.",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}))])
+    req = LlmRequest(model=getattr(model, "model", None),
+                     contents=[types.Content(role="user", parts=[types.Part(text="Reply with the word OK.")])],
+                     config=types.GenerateContentConfig(tools=[tool], max_output_tokens=512))
+
+    async def call() -> list[Any]:
+        return [r async for r in model.generate_content_async(req, stream=False)]
+
+    try:
+        responses = asyncio.run(call())
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"preflight: the model call failed, nothing was started:\n  {type(e).__name__}: {e}")
+    err = next((r.error_message for r in responses if getattr(r, "error_message", None)), None)
+    if err:
+        raise SystemExit(f"preflight: the model returned an error, nothing was started:\n  {err}")
+    parts = [p for r in responses if r.content for p in (r.content.parts or [])]
+    thought = any(getattr(p, "thought", False) for p in parts)
+    text = "".join(p.text or "" for p in parts if p.text and not getattr(p, "thought", False))
+    return (f"preflight OK: {cfg.model} answered {text[:40]!r}; "
+            f"reasoning returned: {'yes' if thought else 'NO (check the model / provider)'}")
+
+
 def classify_agent_error(err: str | None) -> str | None:
     if not err:
         return None
@@ -318,7 +350,7 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
     queue = [t for t in tasks if t["instance_id"] not in done]
     runner = runner_factory()
     lock = threading.Lock()
-    state = {"next": 0, "started": 0, "stop": None}
+    state = {"next": 0, "started": 0, "stop": None, "api_fail_streak": 0}
     t0 = time.time()
     results: list[Attempt] = []
 
@@ -363,6 +395,14 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
                     solved_repo[a.repo.lower()] += 1
                 if a.reason.startswith("FATAL_API_ERROR"):
                     state["stop"] = f"fatal API error, stopping: {a.reason[:200]}"
+                # the model never answering (bad setup, provider down) is not the tasks' fault:
+                # stop instead of burning through the queue
+                if a.reason.startswith("API_ERROR") and not a.stats.get("completion_tokens"):
+                    state["api_fail_streak"] += 1
+                    if state["api_fail_streak"] >= max(3, workers):
+                        state["stop"] = f"the model API failed {state['api_fail_streak']} times in a row: {a.reason[:200]}"
+                elif a.stats.get("completion_tokens"):
+                    state["api_fail_streak"] = 0
                 with results_fp.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(asdict(a), ensure_ascii=False) + "\n")
                 results.append(a)

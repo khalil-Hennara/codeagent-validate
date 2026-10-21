@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -364,6 +365,9 @@ def run_generate(args: argparse.Namespace) -> int:
     if args.teacher_dir:
         cfg.teacher_dir = Path(args.teacher_dir)
     prior = _read_jsonl([p for p in args.prior if Path(p).exists()])
+    from .generate.rollout import preflight
+    cfg.api_base = os.environ.get("OPENROUTER_API_BASE") or None
+    print(preflight(cfg), flush=True)
     print(f"generate: {len(tasks)} candidate tasks, target {targets['solved_target']} solved"
           + (f" (shard {args.shard})" if args.shard else "") + f", model {cfg.model}", flush=True)
 

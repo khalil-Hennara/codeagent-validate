@@ -200,6 +200,27 @@ def test_run_generation_target_limit_and_resume():
     print("ok test_run_generation_target_limit_and_resume")
 
 
+def test_stops_when_the_api_keeps_failing():
+    calls = []
+
+    def failing_run_one(task, *a, **k):
+        calls.append(task["instance_id"])
+        return rollout.Attempt(task["instance_id"], verifier="swe_gym", repo="toy/calc",
+                               reason="API_ERROR: Sandbox execution error: litellm.APIConnectionError: boom",
+                               stats={"completion_tokens": 0})
+
+    real, rollout.run_one = rollout.run_one, failing_run_one
+    try:
+        tasks = [{**TASK, "instance_id": f"t{i}", "selection_rank": i} for i in range(10)]
+        targets = {"solved_target": 5, "max_per_repo": 100, "max_share": {}}
+        rollout.run_generation(tasks, targets, cfg(), Path(tempfile.mkdtemp()), runner_factory=ApplyAndPytestRunner,
+                               workers=1)
+    finally:
+        rollout.run_one = real
+    assert calls == ["t0", "t1", "t2"], calls
+    print("ok test_stops_when_the_api_keeps_failing")
+
+
 def test_classify_and_shards():
     assert rollout.classify_agent_error("Sandbox execution error: litellm.AuthenticationError: bad key") == "FATAL_API_ERROR"
     assert rollout.classify_agent_error("Sandbox execution error: litellm.RateLimitError: 429") == "API_ERROR"
@@ -223,6 +244,10 @@ def test_prepare_script_in_container_layout():
        "git add -A && git -c user.email=a@b -c user.name=a commit -qm base")
     sh("git checkout -qb fix && echo '# future' >> calc.py && git -c user.email=a@b -c user.name=a commit -qam fix "
        "&& git checkout -q main")
+    # a remote whose HEAD is a symref to a branch holding the fix (datalad's R2E image): git refuses
+    # to delete a symref and its target in one batch, so prepare must handle symrefs first
+    sh("git remote add origin https://example.invalid/repo.git && git update-ref refs/remotes/origin/maint fix "
+       "&& git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/maint")
     (root / "setup.patch").write_text(
         "--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a - b\n")
     (src / "r2e_tests").mkdir()
@@ -232,13 +257,14 @@ def test_prepare_script_in_container_layout():
     assert "PREPARE_OK" in subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout
     assert (src.is_symlink() and (ws / "calc.py").read_text().endswith("a - b\n")
             and not (ws / "r2e_tests").exists())
-    assert sh("git branch -a", ws).split() == ["*", "main"]
+    assert sh("git branch -a", ws).split() == ["*", "main"] and sh("git remote", ws) == ""
     assert sh("git status --porcelain", ws) == "" and "future" not in sh("git log --all -p", ws)
     print("ok test_prepare_script_in_container_layout")
 
 
 if __name__ == "__main__":
     test_classify_and_shards()
+    test_stops_when_the_api_keeps_failing()
     test_prepare_script_in_container_layout()
     test_solves_and_records()
     test_wrong_fix_not_solved()

@@ -58,11 +58,17 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
 fi
 mkdir -p .git/info && printf '.venv/\\n' >> .git/info/exclude
 # 3. keep only the base commit's own history
-# (one pass, fast even with thousands of refs, e.g. SWE-smith's per-instance branches)
+# symbolic refs first (e.g. refs/remotes/origin/HEAD -> origin/maint): deleting a symref and its
+# target in one batch is refused by git
+git for-each-ref --format='%(symref) %(refname)' | while read -r target ref; do
+  if [ -n "$ref" ]; then git symbolic-ref --delete "$ref" || true; fi
+done
+# then every other ref that is not an ancestor of HEAD, in one pass (fast even with thousands of
+# refs, e.g. SWE-smith's per-instance branches)
 git for-each-ref --no-merged=HEAD --format='delete %(refname)' | git update-ref --stdin
 rm -f .git/ORIG_HEAD .git/FETCH_HEAD .git/packed-refs.lock
 git stash clear 2>/dev/null || true
-for r in $(git remote); do git remote remove "$r"; done
+for r in $(git remote); do git remote remove "$r" || git config --remove-section "remote.$r" || true; done
 {apply_setup}
 git reflog expire --expire=now --all
 git gc --prune=now --quiet || true
