@@ -279,11 +279,53 @@ def test_recall_of_project_history_is_flagged():
     (out / "r.jsonl").write_text("\n".join(json.dumps(r) for r in (row, ok_row)) + "\n")
     tasks = [{**TASK, "instance_id": "x", "repo": "a/b"}, {**TASK, "instance_id": "y", "repo": "a/b"}]
     targets = {"solved_target": 10, "max_per_repo": 100, "max_share": {}}
-    st = rollout.merge_generation(tasks, [out / "r.jsonl"], targets, out / "m")
-    assert st["accepted"] == 1 and "recalls project history (excluded from solved.jsonl): 1 of 2" in \
+    st = rollout.merge_generation(tasks, [out / "r.jsonl"], targets, out / "m")  # default: keep, clean later
+    assert st["accepted"] == 2 and "recalls project history (to clean with `clean-recall`): 1 of 2" in \
         (out / "m" / "generation_report.md").read_text()
-    assert rollout.merge_generation(tasks, [out / "r.jsonl"], targets, out / "m2", keep_recall=True)["accepted"] == 2
+    assert rollout.merge_generation(tasks, [out / "r.jsonl"], targets, out / "m2", keep_recall=False)["accepted"] == 1
     print("ok test_recall_of_project_history_is_flagged")
+
+
+def test_ledger_resume_never_repeats_a_task():
+    """Run 1 solves t0, fails t1 (wrong fix), and t2 hits a credit error; the ledger keeps all of
+    it. Run 2 (fresh folder, like a new GitHub run) reads the ledger: only t2 and t3 run."""
+    from codeagent_data.generate.ledger import update_ledger
+
+    bad = list(FIX_SCRIPT)
+    bad[1] = ("edit_file", {"filepath": "calc.py", "old_string": "return a - b", "new_string": "return a * b"})
+
+    class PerTaskLlm(ScriptedLlm):
+        async def generate_content_async(self, llm_request, stream=False):
+            prompt = llm_request.contents[0].parts[0].text
+            self.script = bad if "TASK-t1" in prompt else FIX_SCRIPT
+            async for r in super().generate_content_async(llm_request, stream):
+                yield r
+
+    tasks = [{**TASK, "instance_id": f"t{i}", "selection_rank": i,
+              "problem_statement": TASK["problem_statement"] + f" TASK-t{i}"} for i in range(4)]
+    targets = {"solved_target": 10, "max_per_repo": 100, "max_share": {}}
+    kw = dict(runner_factory=ApplyAndPytestRunner, workers=1, sandbox_factory=toy_sandbox_factory,
+              model_override=PerTaskLlm())
+    run1 = Path(tempfile.mkdtemp())
+    rollout.run_generation(tasks[:2], targets, cfg(), run1, attempts=1, **kw)
+    with (run1 / "results.jsonl").open("a") as f:  # t2: the credit ran out mid-task
+        f.write(json.dumps({"instance_id": "t2", "attempt": 1, "solved": False, "verifier": "swe_gym",
+                            "repo": "toy/calc", "reason": "FATAL_API_ERROR: 402 Insufficient credits"}) + "\n")
+    ledger = Path(tempfile.mkdtemp()) / "ledger"
+    st = update_ledger(ledger, [run1 / "results.jsonl"])
+    assert st["tasks_finished"] == 2 and st["tasks_solved"] == 1 and st["tasks_to_retry"] == 1, st
+    assert (ledger / "traces" / "t0__a1.json").exists() and not (ledger / "traces" / "t1__a1.json").exists()
+
+    run2 = Path(tempfile.mkdtemp())
+    prior = [json.loads(x) for x in (ledger / "results.jsonl").read_text().splitlines()]
+    res = rollout.run_generation(tasks, targets, cfg(), run2, attempts=2, prior=prior, **kw)
+    assert sorted(r.instance_id for r in res) == ["t2", "t3"], [r.instance_id for r in res]
+    st = update_ledger(ledger, [run2 / "results.jsonl"])
+    assert st["tasks_finished"] == 4 and st["tasks_solved"] == 3 and st["tasks_to_retry"] == 0, st
+    # the final merge works from the ledger alone (traces included)
+    m = rollout.merge_generation(tasks, [ledger / "results.jsonl"], targets, Path(tempfile.mkdtemp()) / "g")
+    assert m["accepted"] == 3, m
+    print("ok test_ledger_resume_never_repeats_a_task")
 
 
 def test_stops_when_the_api_keeps_failing():
@@ -311,6 +353,8 @@ def test_classify_and_shards():
     assert rollout.classify_agent_error("Sandbox execution error: litellm.AuthenticationError: bad key") == "FATAL_API_ERROR"
     assert rollout.classify_agent_error("Sandbox execution error: litellm.RateLimitError: 429") == "API_ERROR"
     assert rollout.classify_agent_error("Agent exceeded session timeout (45 min)") is None
+    assert rollout.classify_agent_error('OpenrouterException - {"error": {"code": 403, "message": "Budget limit '
+                                        'exceeded (key). $52.00 of $50.00 used"}}') == "FATAL_API_ERROR"
     t = rollout.shard_targets({"solved_target": 2400, "max_per_repo": 120, "max_share": {"a": .5}}, 20)
     assert t["solved_target"] == 126 and t["max_per_repo"] == 7
     tasks = [{"instance_id": str(i), "selection_rank": i} for i in range(10)]
@@ -353,6 +397,7 @@ if __name__ == "__main__":
     test_recall_of_project_history_is_flagged()
     test_stops_when_the_api_keeps_failing()
     test_second_attempt_and_verify_log()
+    test_ledger_resume_never_repeats_a_task()
     test_retry_only_when_promising_and_flaky_rerun()
     test_prepare_script_in_container_layout()
     test_solves_and_records()

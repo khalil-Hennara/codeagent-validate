@@ -232,16 +232,36 @@ def main(argv: list[str] | None = None) -> int:
     gm.add_argument("--results", nargs="+", required=True, help="results.jsonl / results_merged.jsonl (later win)")
     gm.add_argument("--targets", help="targets.json from select")
     gm.add_argument("--n", type=int, default=2400)
-    gm.add_argument("--keep-recall", action="store_true",
-                    help="also accept solved attempts whose reasoning recalls the project's history")
+    gm.add_argument("--drop-recall", action="store_true",
+                    help="leave out solved attempts whose reasoning recalls the project's history "
+                         "(default: keep them, flagged, for `clean-recall`)")
     gm.add_argument("--out", required=True)
+    cr = sub.add_parser("clean-recall", help="rewrite reasoning that recalls the project's history (after generate-merge)")
+    cr.add_argument("--generated", required=True, help="generate-merge output folder (solved.jsonl + traces/)")
+    cr.add_argument("--out", required=True)
+    cr.add_argument("--model", default="moonshotai/kimi-k3", help="OpenRouter model that does the rewriting")
+    cr.add_argument("--extra-body", default='{"reasoning": {"effort": "low"}}', help="JSON added to each request")
+    cr.add_argument("--workers", type=int, default=8)
+    lu = sub.add_parser("ledger-update", help="add results.jsonl files to the permanent generation ledger")
+    lu.add_argument("--ledger", required=True, help="ledger folder (the gen-ledger branch)")
+    lu.add_argument("--results", nargs="+", required=True)
     args = ap.parse_args(argv)
+    if args.cmd == "ledger-update":
+        from .generate.ledger import update_ledger
+        update_ledger(Path(args.ledger), [Path(p) for p in args.results])
+        return 0
+    if args.cmd == "clean-recall":
+        from .generate.clean import CleanConfig, clean_generated
+        clean_generated(Path(args.generated), Path(args.out),
+                        CleanConfig(model=args.model, extra_body=json.loads(args.extra_body) if args.extra_body else None,
+                                    workers=args.workers, api_base=os.environ.get("OPENROUTER_API_BASE") or None))
+        return 0
     if args.cmd == "generate":
         return run_generate(args)
     if args.cmd == "generate-merge":
         from .generate.rollout import merge_generation
         merge_generation(_read_jsonl(args.tasks), [Path(p) for p in args.results],
-                         _load_targets(args.targets, args.n), Path(args.out), keep_recall=args.keep_recall)
+                         _load_targets(args.targets, args.n), Path(args.out), keep_recall=not args.drop_recall)
         return 0
     if args.cmd == "ingest":
         return run_ingest(args)

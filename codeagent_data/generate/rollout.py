@@ -39,7 +39,9 @@ AGENT_PATH = ("/workspace/.venv/bin:/opt/miniconda3/envs/testbed/bin:/opt/minico
 RETRYABLE = ("IMAGE_UNAVAILABLE", "INFRA_ERROR", "PREPARE_FAILED", "API_ERROR")
 _API_ERRORS = ("RateLimitError", "APIConnectionError", "ServiceUnavailable", "InternalServerError",
                "Timeout", "APIError", "BadGateway", "overloaded")
-_FATAL_ERRORS = ("AuthenticationError", "401", "402", "insufficient", "Insufficient credits")
+# 402 = no credit; 403 "Budget limit exceeded" = a spending limit set on the API key (both stop the run)
+_FATAL_ERRORS = ("AuthenticationError", "401", "402", "insufficient", "Insufficient credits",
+                 "Budget limit exceeded", "requires more credits")
 
 
 @dataclass
@@ -368,8 +370,8 @@ def verify_patch(task: dict[str, Any], patch: str, runner: Any, timeout_s: int =
 def retry_worthy(a: "Attempt") -> bool:
     """Spend a second try only where the first one got somewhere: half or more of the F2P tests
     pass, or the patch edits the right files, or the budget ran out before a patch existed."""
-    if a.solved:  # solved, but with recalled-history reasoning: a clean sample is likely
-        return True
+    if a.solved:
+        return False
     if a.reason.startswith("NO_PATCH"):
         return True
     return (a.tests.get("f2p_pass_frac", 0) >= 0.5) or bool(a.loc.get("hit"))
@@ -448,7 +450,9 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
     finished are skipped and their solved ones count toward the target.
 
     `attempts`: an unsolved task is tried again (a new sample; temperature 1.0) up to this many
-    times in total. Retries go to the end of the queue, so new tasks come first."""
+    times in total, within this run only: retries go to the end of the queue, so new tasks come
+    first. A task with a finished attempt from an earlier run (prior / results.jsonl) is never
+    started again; only infrastructure / API failures, where the model did not finish, are."""
     from ..select import should_attempt
 
     out.mkdir(parents=True, exist_ok=True)
@@ -462,16 +466,12 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
     for r in earlier:
         if is_final(r):
             finals.setdefault(r["instance_id"], set()).add(int(r.get("attempt") or 1))
-            if r.get("solved") and not recalls_history(r):
+            if r.get("solved"):
                 solved_ids.setdefault(r["instance_id"], r)
     solved_src = Counter(r["verifier"] for r in solved_ids.values())
     solved_repo = Counter((r.get("repo") or "").lower() for r in solved_ids.values())
 
-    def next_attempt(iid: str) -> int:
-        return max(finals.get(iid, {0})) + 1
-
-    queue = [(t, next_attempt(t["instance_id"])) for t in tasks
-             if t["instance_id"] not in solved_ids and next_attempt(t["instance_id"]) <= attempts]
+    queue = [(t, 1) for t in tasks if t["instance_id"] not in finals]
     runner = runner_factory()
     lock = threading.Lock()
     state = {"next": 0, "started": 0, "stop": None, "api_fail_streak": 0}
@@ -516,11 +516,10 @@ def run_generation(tasks: list[dict[str, Any]], targets: dict[str, Any], cfg: Ge
             if prune_images and t.get("env_image") and sandbox_factory is None:
                 runner.remove_image(t["env_image"])
             with lock:
-                usable = a.solved and not recalls_history(asdict(a))
-                if usable:
+                if a.solved:  # recalled-history reasoning is cleaned afterwards (clean-recall)
                     solved_src[a.verifier] += 1
                     solved_repo[a.repo.lower()] += 1
-                elif is_final(asdict(a)) and k < attempts and (a.solved or retry_worthy(a)):
+                elif is_final(asdict(a)) and k < attempts and retry_worthy(a):
                     queue.append((t, k + 1))  # another sample later
                 if a.reason.startswith("FATAL_API_ERROR"):
                     state["stop"] = f"fatal API error, stopping: {a.reason[:200]}"
@@ -564,6 +563,7 @@ def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any]
         c = by_src.setdefault(r.get("verifier") or "?", Counter())
         c["attempted"] += 1
         c["solved"] += bool(r.get("solved"))
+        c["usable"] += bool(r.get("solved")) and not recalls_history(r)
         reasons[str(r.get("reason", "")).split(":")[0].split(" (")[0]] += 1
         cost += float(r.get("est_cost_usd") or 0)
         st = r.get("stats") or {}
@@ -575,22 +575,26 @@ def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any]
         ctx.append(st.get("max_context_tokens", 0))
         secs += float(r.get("seconds") or 0)
     n, solved = len(final), sum(bool(r.get("solved")) for r in final)
+    usable = sum(bool(r.get("solved")) and not recalls_history(r) for r in final)
     task_ids = {r["instance_id"] for r in final}
     solved_tasks = {r["instance_id"] for r in final if r.get("solved")}
     first = [r for r in final if int(r.get("attempt") or 1) == 1]
-    lines = ["# Generation report", "", f"attempts: {n}  solved: {solved}"
-             + (f"  ({solved / n:.0%})" if n else ""),
+    lines = ["# Generation report", "",
+             f"solved without recalled history: {usable} of {n} attempts" + (f" ({usable / n:.0%})" if n else "")
+             + "; the others are cleaned by `clean-recall`",
+             f"attempts: {n}  solved: {solved}" + (f"  ({solved / n:.0%})" if n else ""),
              f"tasks: {len(task_ids)}  solved: {len(solved_tasks)}"
              + (f"  ({len(solved_tasks) / len(task_ids):.0%}; first try "
                 f"{sum(bool(r.get('solved')) for r in first) / max(1, len(first)):.0%})" if task_ids else ""), ""]
-    lines += ["| source | attempted | solved | rate |", "| --- | --- | --- | --- |"]
+    lines += ["| source | attempted | solved | rate | solved without recall |", "| --- | --- | --- | --- | --- |"]
     for s, c in sorted(by_src.items()):
-        lines.append(f"| {s} | {c['attempted']} | {c['solved']} | {c['solved'] / max(1, c['attempted']):.0%} |")
+        lines.append(f"| {s} | {c['attempted']} | {c['solved']} | {c['solved'] / max(1, c['attempted']):.0%} "
+                     f"| {c['usable']} |")
     lines += ["", "## Outcomes", ""] + [f"- {k}: {v}" for k, v in reasons.most_common()]
     solved_rows = [r for r in final if r.get("solved")]
     if solved_rows:
         rec = sum(recalls_history(r) for r in solved_rows)
-        lines += ["", f"solved attempts whose reasoning recalls project history (excluded from solved.jsonl): "
+        lines += ["", f"solved attempts whose reasoning recalls project history (to clean with `clean-recall`): "
                       f"{rec} of {len(solved_rows)}"]
     unsolved = [r for r in final if not r.get("solved") and r.get("patch")]
     if unsolved:
@@ -617,7 +621,8 @@ def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any]
                   f"- longest context per attempt: median {sorted(ctx)[len(ctx) // 2]:,} tokens, max {max(ctx):,}",
                   f"- tool calls: {n_calls / n:.1f}   reasoning blocks captured: {n_think / n:.1f}"
                   + ("   <-- NO REASONING CAPTURED: check the model/provider" if n_calls and not n_think else ""),
-                  f"- estimated cost: ${cost / n:.3f} per attempt, ${cost / max(1, solved):.3f} per solved task"
+                  f"- estimated cost: ${cost / n:.3f} per attempt, ${cost / max(1, solved):.3f} per solved task, "
+                  f"${cost / max(1, usable):.3f} per solve without recall"
                   + ("" if cost else "  (pass --price-in/--price-out to estimate)"),
                   f"- wall time: {secs / n / 60:.1f} min per attempt"]
         if targets and solved:
@@ -635,7 +640,7 @@ def render_generation_report(rows: list[dict[str, Any]], targets: dict[str, Any]
 
 
 def merge_generation(tasks: list[dict[str, Any]], result_files: list[Path], targets: dict[str, Any],
-                     out: Path, keep_recall: bool = False) -> dict[str, int]:
+                     out: Path, keep_recall: bool = True) -> dict[str, int]:
     """Combine results from shards and earlier runs (later files win) and apply the GLOBAL limits:
     solved tasks are accepted in selection-rank order while their source / repo is under its cap.
 

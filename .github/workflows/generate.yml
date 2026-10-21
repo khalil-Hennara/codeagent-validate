@@ -14,8 +14,11 @@
 #             DOCKERHUB_USERNAME + DOCKERHUB_TOKEN (optional, avoids pull limits)
 #   optional  variable HARNESS_REPO + secret HARNESS_TOKEN: take the harness from a private repo instead
 # Task files: data/gen/part-*.jsonl (valid tasks, rank order) and data/targets.json, see README.
-# To continue after a run: download the `generated` artifact, commit its results_merged.jsonl as
-# data/gen_done.jsonl and run again (finished tasks are skipped, their solves count).
+# Progress is kept automatically on the `gen-ledger` branch (codeagent_data/generate/ledger.py):
+# every run reads it first and never starts a task that already has a finished attempt (solved or
+# not); only tasks whose attempt ended in an infrastructure/API error (e.g. credit ran out) are
+# tried again. The merge job adds each run's results to it, also after a cancel or a timeout.
+# Solved traces are stored there too, so nothing depends on artifacts that expire.
 
 name: generate-trajectories
 
@@ -53,8 +56,13 @@ on:
         description: "Agent time budget per task (minutes)"
         default: "45"
 
-# results of earlier runs (committed by you, see the header): finished tasks are skipped
+# one run at a time: runs share the ledger branch
+concurrency:
+  group: generate-trajectories
+  cancel-in-progress: false
+
 env:
+  # extra results of earlier runs committed by hand (optional; the gen-ledger branch is read anyway)
   PRIOR: data/gen_done.jsonl
   # tries per task until it is solved (each try is a new sample; a second try is only spent when
   # the first got somewhere: half the F2P tests pass, or it edited a file of the reference fix)
@@ -91,6 +99,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: true
+
+      - name: Read the ledger (tasks already done in earlier runs)
+        run: |
+          if git fetch -q --depth 1 origin gen-ledger; then
+            git show FETCH_HEAD:results.jsonl > ledger_prior.jsonl
+            echo "ledger: $(wc -l < ledger_prior.jsonl) earlier attempts"
+          else
+            echo "no ledger yet (first run)"; : > ledger_prior.jsonl
+          fi
 
       - name: Fetch the harness (private repo)
         if: env.HARNESS_REPO != ''
@@ -159,7 +176,7 @@ jobs:
           effort=(); [ -n "$EFFORT" ] && effort=(--reasoning-effort "$EFFORT")
           # $TASKS is a glob on purpose: let the shell expand it
           python -m codeagent_data generate $TASKS "${targets[@]}" "${effort[@]}" \
-            --shard "$SHARD/$N" --out "out/shard_$SHARD" --prior "$PRIOR" \
+            --shard "$SHARD/$N" --out "out/shard_$SHARD" --prior "$PRIOR" ledger_prior.jsonl \
             --workers "$WORKERS" --limit "$LIMIT" --max-minutes "$MAX_MIN" --prune-images \
             --model "$MODEL" --extra-body "$EXTRA" --time-minutes "$TIME_MIN" --attempts "$ATTEMPTS" \
             --max-gold-lines "$MAX_GOLD_LINES" --max-gold-files "$MAX_GOLD_FILES" \
@@ -178,6 +195,8 @@ jobs:
     needs: generate
     if: always()
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the ledger branch
     steps:
       - uses: actions/checkout@v4
         with:
@@ -190,15 +209,36 @@ jobs:
         with:
           pattern: gen-shard-*
           path: shards
-      - name: Merge shards (+ earlier runs) under the global limits
+      - name: Open the ledger branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir ledger && cd ledger && git init -q
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git fetch -q --depth 1 origin gen-ledger; then
+            git checkout -q -b gen-ledger FETCH_HEAD
+          else
+            git checkout -q --orphan gen-ledger
+          fi
+      - name: Add this run to the ledger and merge under the global limits
         env:
           TASKS: ${{ inputs.tasks }}
         run: |
           prev=(); [ -f "$PRIOR" ] && prev=("$PRIOR")
+          python -m codeagent_data ledger-update --ledger ledger --results "${prev[@]}" shards/*/results.jsonl
           targets=(); [ -f data/targets.json ] && targets=(--targets data/targets.json)
           python -m codeagent_data generate-merge --tasks $TASKS "${targets[@]}" \
-            --results "${prev[@]}" shards/*/results.jsonl --out out/generated
-          cat out/generated/generation_report.md >> "$GITHUB_STEP_SUMMARY"
+            --results ledger/results.jsonl --out out/generated
+          cp out/generated/generation_report.md ledger/report.md
+          cat ledger/README.md out/generated/generation_report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Save the ledger
+        run: |
+          cd ledger
+          git add -A
+          if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
+          git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+            commit -qm "ledger: run ${GITHUB_RUN_ID}"
+          git push -q origin gen-ledger
       - uses: actions/upload-artifact@v4
         with:
           name: generated

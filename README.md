@@ -502,14 +502,29 @@ The job summary shows the report. Check before scaling:
 ### Full run
 
 `num_shards=20`, `limit=0`. Each job stops starting tasks after `max_minutes` (default 290)
-or when its share of the target is solved. To continue: download the `generated` artifact,
-commit its `results_merged.jsonl` as `data/gen_done.jsonl`, run again (finished tasks are
-skipped and their solves count). Keep every run's `generated` artifact: each holds the traces of
-the tasks it solved. Final assembly, locally or on Colab:
+or when its share of the target is solved. To continue, just run the workflow again: nothing to
+download or commit.
+
+**Progress is kept on the `gen-ledger` branch** of this repository, written by the merge job of
+every run (also after a cancel, a timeout or when the credit runs out, since each shard records
+its attempts as it goes):
+
+- `results.jsonl`: every attempt (task, try, outcome, tokens, cost estimate, patch, test progress)
+- `traces/`: the trace of every solved attempt (permanent; artifacts expire after 90 days)
+- `README.md` (counts), `report.md` (the latest generation report)
+
+Each run reads the ledger first and **never starts a task that already has a finished attempt**,
+solved or not. Only tasks whose attempt ended in an infrastructure or API error (the model did not
+finish, e.g. `FATAL_API_ERROR: 402 Insufficient credits`) are tried again. A second try
+(`ATTEMPTS`) happens only within the same run. Runs are queued one at a time (`concurrency`), so
+they never write the ledger at once.
+
+Final assembly, on Colab or locally:
 
 ```bash
-python -m codeagent_data generate-merge --tasks data/gen/*.jsonl --targets data/targets.json \
-    --results run1/results_merged.jsonl run2/results_merged.jsonl run3/results_merged.jsonl --out out/final
+git clone -b gen-ledger --single-branch https://github.com/<you>/codeagent-validate.git ledger
+python -m codeagent_data generate-merge --tasks data/gen/*.jsonl --results ledger/results.jsonl --out out/final
+python -m codeagent_data clean-recall --generated out/final --out out/cleaned
 ```
 
 ### Locally (any machine with Docker)
@@ -545,11 +560,24 @@ near-misses that edited the right files stay in `results_merged.jsonl` for local
 The report shows the solve rate by size of the reference fix; `MAX_GOLD_LINES` /
 `MAX_GOLD_FILES` in the workflow (or `--max-gold-lines/--max-gold-files`) skip larger tasks.
 
-The teacher must reason only from what it observes. Kimi otherwise "recalls" the project's real
-fix (commit hashes, PR numbers, "pandas main today"), which the student cannot do and which is
-mostly invented. The prompt forbids it, and every attempt counts such phrases
-(`stats.recall_mentions`); a solved attempt with 3 or more is not counted, gets another try, and
-is left out of `solved.jsonl` (`generate-merge --keep-recall` to include it).
+The teacher must reason only from what it observes. Kimi nevertheless often "recalls" the
+project's real fix in its reasoning (commit hashes, PR numbers, "pandas main today"), even when the
+prompt forbids it; the student cannot do that. Every attempt counts such phrases
+(`stats.recall_mentions`, 3 or more = recalls history). These solves are kept, flagged, and cleaned
+after `generate-merge`: `clean-recall` rewrites only the affected reasoning entries (recalled
+claims removed, the technical idea kept as the agent's own proposal, nothing added), checks the
+result with the same detector, and drops an entry's text if two rewrites fail. Tool calls,
+results and the patch are never changed; the original text stays in `cleaned_from` for audit.
+It needs only internet and the OpenRouter key (Colab is fine):
+
+```bash
+pip install -r requirements.txt litellm==1.106.0
+export OPENROUTER_API_KEY=...
+python -m codeagent_data clean-recall --generated generated --out cleaned
+```
+
+Spot-check a few cleaned traces (`content` against `cleaned_from`) before training.
+`generate-merge --drop-recall` leaves these solves out instead.
 
 Before any container starts, `generate` sends one small request through exactly the agent's
 model path (`preflight OK ... reasoning returned: yes` in the log); a wrong key, model id or a
