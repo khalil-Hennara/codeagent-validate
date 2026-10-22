@@ -593,7 +593,9 @@ local sandbox), `tests/test_openrouter_wire.py` (real model path, fake server),
 How each trajectory found the code to change, measured against the reference fix (its source
 files and hunk line ranges; docs and changelogs ignored): calls and searches before the first
 read of a gold file, non-gold "detour" files opened before it, whether it looked at the exact
-changed lines, whether the first edit went to a gold file. Each trajectory gets a `path`:
+changed lines, whether the first edit went to a gold file. A solved attempt is also profiled
+against its own verified patch, since a correct fix can sit somewhere else than the reference fix
+(`fixed_elsewhere`); its `path` uses that patch. Each trajectory gets a `path`:
 `direct`, `searched`, `struggled` (4+ detour files, 15+ calls before finding it, or a first edit
 outside the fix) or `never_found`.
 
