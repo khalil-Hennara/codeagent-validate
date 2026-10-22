@@ -245,7 +245,17 @@ def main(argv: list[str] | None = None) -> int:
     lu = sub.add_parser("ledger-update", help="add results.jsonl files to the permanent generation ledger")
     lu.add_argument("--ledger", required=True, help="ledger folder (the gen-ledger branch)")
     lu.add_argument("--results", nargs="+", required=True)
+    ls_ = sub.add_parser("loc-stats", help="how each trajectory found the code to change (localization profile)")
+    ls_.add_argument("--tasks", nargs="+", required=True, help="task files with the reference fix (data/gen/*.jsonl)")
+    ls_.add_argument("--results", nargs="+", required=True, help="results.jsonl files (ledger and/or shard artifacts)")
+    ls_.add_argument("--trace-dirs", nargs="*", default=[], help="extra folders to look for traces in (shard artifacts)")
+    ls_.add_argument("--out", required=True)
     args = ap.parse_args(argv)
+    if args.cmd == "loc-stats":
+        from .generate.locstats import run_loc_stats
+        run_loc_stats(_read_jsonl(args.tasks), [Path(p) for p in args.results], [Path(p) for p in args.trace_dirs],
+                      Path(args.out))
+        return 0
     if args.cmd == "ledger-update":
         from .generate.ledger import update_ledger
         update_ledger(Path(args.ledger), [Path(p) for p in args.results])

@@ -588,6 +588,23 @@ Tests: `PYTHONPATH=harness python3 tests/test_generate.py` (real agent loop, scr
 local sandbox), `tests/test_openrouter_wire.py` (real model path, fake server),
 `tests/test_generate_docker.py` (real Docker; first `docker build -t toy/calc:1 tests/toy_image`).
 
+### Localization profiles: `loc-stats`
+
+How each trajectory found the code to change, measured against the reference fix (its source
+files and hunk line ranges; docs and changelogs ignored): calls and searches before the first
+read of a gold file, non-gold "detour" files opened before it, whether it looked at the exact
+changed lines, whether the first edit went to a gold file. Each trajectory gets a `path`:
+`direct`, `searched`, `struggled` (4+ detour files, 15+ calls before finding it, or a first edit
+outside the fix) or `never_found`.
+
+```bash
+python -m codeagent_data loc-stats --tasks data/gen/*.jsonl --results ledger/results.jsonl \
+    --trace-dirs shards/* --out out/loc        # shards/*: unzipped gen-shard artifacts (unsolved traces)
+```
+
+The ledger keeps only solved traces; unsolved ones (useful as "never found" / "struggled"
+examples) live in the `gen-shard-*` artifacts, which GitHub deletes after 90 days.
+
 ## 5. Next: parse
 
 y\*, L_edit, L_view, search queries and reasoning from `solved.jsonl` + traces, for the
